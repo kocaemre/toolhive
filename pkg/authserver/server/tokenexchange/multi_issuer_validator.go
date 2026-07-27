@@ -99,10 +99,15 @@ type TrustedIssuer struct {
 	// (mirrors the empty-AllowedAudiences convention documented on
 	// NewSelfIssuedTokenValidator).
 	//
-	// Accepted limitation: an allowlisted actor satisfies consent for ANY
-	// ToolHive confidential client holding the token-exchange grant. The
-	// allowlist authorizes "this external client's tokens may be exchanged
-	// here", not "...by this particular ToolHive client".
+	// Accepted limitation (see #5989 and checkDelegationConsent's doc comment
+	// in handler.go for the full rationale): an allowlisted actor satisfies
+	// consent for ANY ToolHive confidential client holding the
+	// token-exchange grant — every such client is delegation-equivalent, so
+	// compromise of the weakest one suffices, and the allowlist itself gives
+	// no per-client containment. Keeping this grant's client set minimal is
+	// the operator's real control. Bounded by: the calling client must
+	// already possess a valid subject token, and scope/audience narrowing
+	// still applies to the exchanged result.
 	AllowedActors []string `json:"allowed_actors,omitempty" yaml:"allowed_actors,omitempty"`
 }
 
@@ -114,13 +119,18 @@ type TrustedIssuer struct {
 // issuers, the validator resolves the issuer's JWKS (via OIDC discovery if needed),
 // verifies the JWT signature, and validates standard claims.
 //
-// External subject tokens carry no client_id claim, so a valid signature and
-// audience alone would authorize ToolHive as a resource, not any particular
-// client, as a delegate — a confused-deputy risk (CWE-863). validateExternalToken
-// therefore requires one of two consent signals before returning successfully:
-// a "may_act" claim (authoritative; enforced by the caller against the
-// authenticated client), or the issuer's configured actor claim matching an
-// entry in that issuer's AllowedActors.
+// A valid signature and audience alone would authorize ToolHive as a
+// resource, not any particular client, as a delegate — a confused-deputy risk
+// (CWE-863). An external token's "client_id" claim, when present, names a
+// client in the EXTERNAL issuer's namespace, not a ToolHive client ID, so it
+// cannot serve as the client_id-binding consent signal the self-issued path
+// uses (checkDelegationConsent's client_id case in handler.go).
+// validateExternalToken therefore requires one of two consent signals before
+// returning successfully: a "may_act" claim (authoritative; enforced by the
+// caller against the authenticated client), or the issuer's configured actor
+// claim matching an entry in that issuer's AllowedActors — surfaced as
+// ValidatedClaims.ExternalActor, which checkDelegationConsent must check
+// before its client_id fallback.
 type MultiIssuerTokenValidator struct {
 	selfIssuer    string
 	selfValidator *SelfIssuedTokenValidator
@@ -319,10 +329,23 @@ func (v *MultiIssuerTokenValidator) validateExternalToken(
 
 	// Delegation consent for the external path: a may_act claim is
 	// authoritative and is enforced by the caller (checkDelegationConsent)
-	// against the authenticated client, so nothing further is required here.
+	// against the authenticated client, so nothing further is required here
+	// — the AllowedActors allowlist below is skipped entirely whenever
+	// MayAct is set. That means a trusted external issuer emitting may_act
+	// controls consent directly: may_act.sub is later compared against a
+	// ToolHive client ID by checkDelegationConsent, so an operator enabling
+	// may_act on an external TrustedIssuer must ensure that claim is drawn
+	// from ToolHive's own client namespace and cannot be influenced by an
+	// untrusted party — it must not be treated as a value in the external
+	// issuer's namespace the way the actor claim below is.
+	//
 	// Otherwise, the resolved actor claim must be present in this issuer's
-	// AllowedActors — this is the only consent signal available for tokens
-	// without may_act, since external tokens carry no client_id claim.
+	// AllowedActors — this is the consent signal for tokens without
+	// may_act. Even when the resolved claim is "client_id" (ActorClaim:
+	// "client_id"), it names a client in the external issuer's namespace,
+	// not a ToolHive client ID, so it cannot be compared against the
+	// authenticated ToolHive client the way ValidatedClaims.ClientID is in
+	// the self-issued path.
 	if claims.MayAct == nil {
 		actor, err := resolveAllowedActor(issuerConfig, claims)
 		if err != nil {
