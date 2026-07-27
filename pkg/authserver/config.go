@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/stacklok/toolhive/pkg/authserver/server/handlers"
 	"github.com/stacklok/toolhive/pkg/authserver/server/keys"
 	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
+	"github.com/stacklok/toolhive/pkg/authserver/server/tokenexchange"
 	"github.com/stacklok/toolhive/pkg/authserver/storage"
 	"github.com/stacklok/toolhive/pkg/authserver/upstream"
 	"github.com/stacklok/toolhive/pkg/networking"
@@ -117,6 +119,31 @@ type RunConfig struct {
 	// Production deployments reachable outside the cluster MUST use https://.
 	//nolint:lll // field tags require full JSON+YAML names
 	InsecureAllowHTTP bool `json:"insecure_allow_http,omitempty" yaml:"insecure_allow_http,omitempty"`
+
+	// TrustedIssuers lists external OIDC issuers whose tokens are accepted as
+	// subject tokens during RFC 8693 token exchange. Empty (the default) means
+	// only self-issued subject tokens are accepted.
+	//
+	// Fail-closed consent per issuer: an empty AllowedActors accepts only
+	// subject tokens carrying a "may_act" claim; every other token from that
+	// issuer is rejected. See tokenexchange.TrustedIssuer for the full field
+	// reference, and the two operator-facing constraints below that are not
+	// visible from the config shape alone:
+	//
+	//  1. Audience: the token-exchange handler bounds the requested audience
+	//     by the subject token's own "aud" claim. An external IdP's "aud" is
+	//     typically an app-ID GUID or "api://<app-id>", not one of ToolHive's
+	//     http(s) AllowedAudiences URIs, so an ordinary
+	//     resource=https://mcp.example.com request will fail with
+	//     invalid_target on every call. The external path only works if the
+	//     operator configures the external IdP's API identifier to be exactly
+	//     one of ToolHive's AllowedAudiences URIs.
+	//  2. Scopes: the handler intersects the client's registered scopes with
+	//     the subject token's "scope" claim. A subject token with no "scope"
+	//     claim grants a zero-scope delegated token — correct and fail-closed,
+	//     but easy to mistake for a bug on first use.
+	//nolint:lll // field tags require full JSON+YAML names
+	TrustedIssuers []tokenexchange.TrustedIssuer `json:"trusted_issuers,omitempty" yaml:"trusted_issuers,omitempty"`
 }
 
 // Validate checks that the on-disk RunConfig is internally consistent. Called
@@ -128,6 +155,15 @@ func (c *RunConfig) Validate() error {
 		if err := c.CIMD.Validate(); err != nil {
 			return fmt.Errorf("cimd: %w", err)
 		}
+	}
+	// Also checked by Config.Validate() (same reasoning as
+	// validateBaselineClientScopes below): buildUpstreamConfigs performs live
+	// RFC 7591 registration against upstream IdPs before authserver.New ever
+	// reaches Config.Validate(), so a malformed trusted-issuer URL must fail
+	// here, before that side-effecting work runs — not on a crash loop after
+	// it.
+	if err := validateTrustedIssuerURLs(c.TrustedIssuers, c.InsecureAllowHTTP); err != nil {
+		return err
 	}
 	return c.validateBaselineClientScopes()
 }
@@ -685,6 +721,13 @@ type Config struct {
 	// Only set this for in-cluster Kubernetes deployments on a trusted network.
 	// Production deployments reachable outside the cluster MUST use https://.
 	InsecureAllowHTTP bool
+
+	// TrustedIssuers lists external OIDC issuers whose tokens are accepted as
+	// subject tokens during RFC 8693 token exchange. See the identically
+	// named field on RunConfig for the full doc comment, including the
+	// fail-closed AllowedActors semantics and the audience/scope constraints
+	// operators must account for.
+	TrustedIssuers []tokenexchange.TrustedIssuer
 }
 
 // Validate checks that the Config is valid.
@@ -749,6 +792,15 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	// RunConfig.Validate() also runs this (see the comment there for why:
+	// buildUpstreamConfigs's live DCR registration happens before this method
+	// is reached), but a caller that constructs Config directly bypasses that,
+	// same as the BaselineClientScopes check above.
+	if err := validateTrustedIssuerURLs(c.TrustedIssuers, c.InsecureAllowHTTP); err != nil {
+		return err
+	}
+	c.warnTrustedIssuerAudiences()
+
 	slog.Debug("authserver config validation passed",
 		"issuer", c.Issuer,
 		"upstream_count", len(c.Upstreams),
@@ -784,6 +836,89 @@ func (c *Config) validateDelegationTokenLifespan() error {
 		return fmt.Errorf("delegation token lifespan must not exceed %v", oauthserver.MaxAccessTokenLifespan)
 	}
 	return nil
+}
+
+// validateTrustedIssuerURLs checks the URL fields of each configured
+// TrustedIssuer that NewMultiIssuerTokenValidator's constructor cannot check
+// on its own. Shared by RunConfig.Validate() and Config.Validate() — see the
+// comments at both call sites for why the same check must run at both
+// layers (mirrors validateBaselineClientScopes).
+//
+// IssuerURL is an OIDC issuer identifier, so it is held to the same rules as
+// the server's own Issuer via validateIssuerURL (https, or http when
+// insecureAllowHTTP permits it — including its localhost exception; no
+// query, fragment, or trailing slash). JWKSURL, when set, is an ordinary
+// endpoint URL rather than an issuer identifier — real-world jwks_uri
+// values legitimately carry a query string (e.g. Azure AD B2C's includes
+// "?p=...") — so it is checked by validateJWKSEndpointURL instead, which has
+// no localhost exception: resolveJWKS's dial-time isDisallowedIP guard
+// blocks loopback JWKS fetches unconditionally, so a loopback jwks_url can
+// never succeed at exchange time regardless of insecureAllowHTTP, and
+// failing at config time beats failing on the first token exchange.
+//
+// Everything else (required fields, self-issuer collision, duplicate
+// issuers, ActorClaim reachability) is validated by
+// NewMultiIssuerTokenValidator at server startup and is deliberately not
+// duplicated here.
+func validateTrustedIssuerURLs(issuers []tokenexchange.TrustedIssuer, insecureAllowHTTP bool) error {
+	for _, ti := range issuers {
+		if err := validateIssuerURL(ti.IssuerURL, insecureAllowHTTP); err != nil {
+			return fmt.Errorf("trusted_issuers: issuer_url %q: %w", ti.IssuerURL, err)
+		}
+		if ti.JWKSURL != "" {
+			if err := validateJWKSEndpointURL(ti.JWKSURL, insecureAllowHTTP); err != nil {
+				return fmt.Errorf("trusted_issuers: jwks_url %q: %w", ti.JWKSURL, err)
+			}
+		}
+	}
+	return nil
+}
+
+// validateJWKSEndpointURL checks that rawURL parses, has a host, and uses
+// the "https" scheme (or "http" when insecureAllowHTTP is set). Unlike
+// validateIssuerURL, it does not enforce OIDC issuer-identifier rules
+// (no query/fragment/trailing-slash) since a JWKS endpoint legitimately
+// carries those.
+//
+// Deliberately not networking.ValidateEndpointURL /
+// ValidateEndpointURLWithInsecure: both also honor the
+// INSECURE_DISABLE_URL_VALIDATION environment variable, which would let an
+// unrelated env var silently disable this SSRF-relevant scheme check; the
+// insecure variant also skips the parse/host check entirely rather than
+// only relaxing the scheme. This helper takes its "insecure" bit solely from
+// the operator's explicit InsecureAllowHTTP config field.
+func validateJWKSEndpointURL(rawURL string, insecureAllowHTTP bool) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("host is required")
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && insecureAllowHTTP) {
+		return fmt.Errorf("scheme must be https (or http when insecure_allow_http is set)")
+	}
+	return nil
+}
+
+// warnTrustedIssuerAudiences logs a warning for each TrustedIssuer whose
+// ExpectedAudience is absent from AllowedAudiences. This is not a hard
+// error: a subject token may carry additional audiences beyond
+// ExpectedAudience, so the mismatch is sufficient-but-not-necessary for
+// every exchange from that issuer to fail — an operator may know a specific
+// subject token will present a matching aud even though ExpectedAudience
+// itself is not in AllowedAudiences. But when it's not intentional, this is
+// the invalid_target footgun documented on the TrustedIssuers field: warn so
+// it surfaces at startup instead of at the first exchange attempt.
+func (c *Config) warnTrustedIssuerAudiences() {
+	for _, ti := range c.TrustedIssuers {
+		if !slices.Contains(c.AllowedAudiences, ti.ExpectedAudience) {
+			slog.Warn("trusted issuer's expected_audience is not in allowed_audiences; "+
+				"token exchange will fail with invalid_target unless subject tokens from it "+
+				"carry an additional audience matching one",
+				"issuer", ti.IssuerURL, "expected_audience", ti.ExpectedAudience)
+		}
+	}
 }
 
 // Validate checks that the OAuth2UpstreamRunConfig is internally consistent.

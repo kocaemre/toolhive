@@ -71,6 +71,13 @@ var _ SubjectTokenValidator = (*MultiIssuerTokenValidator)(nil)
 
 // TrustedIssuer configures an external OIDC issuer whose tokens are
 // accepted as subject tokens during token exchange.
+//
+// This type is reused verbatim as the wire schema for
+// authserver.RunConfig.TrustedIssuers (deliberately, to avoid a parallel
+// type that drifts — see the go-style rule against that). Its JSON/YAML
+// tags are therefore part of the serialized RunConfig, which is reflected
+// into docs/server/swagger.*; adding, renaming, or retagging a field here is
+// a schema change, not a purely internal one.
 type TrustedIssuer struct {
 	// IssuerURL is the expected "iss" claim value (exact match).
 	IssuerURL string `json:"issuer_url" yaml:"issuer_url"`

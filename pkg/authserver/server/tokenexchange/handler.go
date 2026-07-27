@@ -525,9 +525,14 @@ func (h *Handler) grantDefaultAudience(ctx context.Context, requester fosite.Acc
 
 // ensureAudienceSubsetOfSubject verifies that every audience granted to the
 // delegated token is covered by the subject token's own audience. A subject
-// token always carries at least one audience (the validator rejects tokens
-// whose aud does not intersect the server's allowed audiences), so an empty
-// subject audience here can only reject.
+// token always carries at least one audience, so an empty subject audience
+// here can only reject — but what guarantees that non-empty audience differs
+// by path. On the self-issued path, SelfIssuedTokenValidator rejects tokens
+// whose aud does not intersect this server's AllowedAudiences. On the
+// external path, validateExternalToken instead requires aud to contain the
+// issuer's own configured ExpectedAudience, which has no required
+// relationship to AllowedAudiences — see the TrustedIssuers field doc
+// comment in pkg/authserver/config.go for the operator-facing consequence.
 func ensureAudienceSubsetOfSubject(granted, subjectAud []string) error {
 	subj := make(map[string]bool, len(subjectAud))
 	for _, a := range subjectAud {
