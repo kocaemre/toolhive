@@ -12,6 +12,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"maps"
+	"net"
 	"net/url"
 	"reflect"
 	"slices"
@@ -520,6 +521,48 @@ func (*VirtualMCPServerReconciler) validateAuthServerConfig(
 					"set spec.authServerConfig.insecureAllowHTTP: true to allow this for trusted "+
 					"in-cluster deployments, or use https:// for production deployments",
 				cfg.Issuer,
+			)
+			statusManager.SetPhase(mcpv1beta1.VirtualMCPServerPhaseFailed)
+			statusManager.SetMessage(message)
+			statusManager.SetAuthServerConfigValidatedCondition(
+				mcpv1beta1.ConditionReasonAuthServerConfigInvalid,
+				message,
+				metav1.ConditionFalse,
+			)
+			statusManager.SetObservedGeneration(vmcp.Generation)
+			return stderrors.New(message)
+		}
+	}
+
+	// Admission-time check: a trusted issuer's issuerUrl or jwksUrl must not
+	// be a private/loopback IP literal unless that issuer's own
+	// allowPrivateIPs permits it. The CRD's CEL rules already reject a
+	// trustedIssuers[].issuerUrl colliding with issuer, a denylisted
+	// actorClaim, a non-https scheme, and (via listType=map) a duplicate
+	// issuerUrl — this private-IP-literal shape is the one thing those
+	// rules cannot express, and — like the insecureAllowHTTP check above —
+	// it needs no network I/O to catch here rather than at pod startup or
+	// the first token exchange.
+	for i, ti := range cfg.TrustedIssuers {
+		if ti.AllowPrivateIPs {
+			continue
+		}
+		for _, raw := range []string{ti.IssuerURL, ti.JWKSURL} {
+			if raw == "" {
+				continue
+			}
+			parsed, err := url.Parse(raw)
+			if err != nil || parsed.Hostname() == "" {
+				continue // malformed values are already rejected by the CRD's Pattern markers
+			}
+			ip := net.ParseIP(parsed.Hostname())
+			if ip == nil || !networking.IsPrivateIP(ip) {
+				continue
+			}
+			message := fmt.Sprintf(
+				"spec.authServerConfig.trustedIssuers[%d]: %q resolves to a private or loopback "+
+					"address; set spec.authServerConfig.trustedIssuers[%d].allowPrivateIPs: true to allow this",
+				i, raw, i,
 			)
 			statusManager.SetPhase(mcpv1beta1.VirtualMCPServerPhaseFailed)
 			statusManager.SetMessage(message)

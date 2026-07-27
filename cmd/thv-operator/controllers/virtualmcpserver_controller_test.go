@@ -4166,3 +4166,110 @@ func TestVirtualMCPServerValidateAuthServerConfig_InsecureAllowHTTP(t *testing.T
 		})
 	}
 }
+
+// TestVirtualMCPServerValidateAuthServerConfig_TrustedIssuerPrivateIPs exercises
+// the admission-time check that rejects a trustedIssuers[].issuerUrl or jwksUrl
+// resolving to a private/loopback IP literal unless that issuer's own
+// allowPrivateIPs permits it. This is the one thing the CRD's CEL rules cannot
+// express (parsing a URL's host as an IP literal); everything else about
+// trustedIssuers (self-issuer collision, duplicate issuerUrl, actorClaim
+// denylist, https-only scheme) is already rejected at admission.
+func TestVirtualMCPServerValidateAuthServerConfig_TrustedIssuerPrivateIPs(t *testing.T) {
+	t.Parallel()
+
+	validUpstreams := []mcpv1beta1.UpstreamProviderConfig{
+		{
+			Name: "dex",
+			Type: mcpv1beta1.UpstreamProviderTypeOIDC,
+			OIDCConfig: &mcpv1beta1.OIDCUpstreamConfig{
+				IssuerURL: "https://dex.example.com",
+				ClientID:  "test-client",
+			},
+		},
+	}
+
+	tests := []struct {
+		name          string
+		trustedIssuer mcpv1beta1.TrustedIssuerConfig
+		wantErr       bool
+	}{
+		{
+			name: "public issuerUrl: valid",
+			trustedIssuer: mcpv1beta1.TrustedIssuerConfig{
+				IssuerURL:        "https://idp.example.com",
+				ExpectedAudience: "aud",
+			},
+		},
+		{
+			name: "private-IP issuerUrl without allowPrivateIPs: rejected",
+			trustedIssuer: mcpv1beta1.TrustedIssuerConfig{
+				IssuerURL:        "https://10.0.0.5",
+				ExpectedAudience: "aud",
+			},
+			wantErr: true,
+		},
+		{
+			name: "loopback issuerUrl without allowPrivateIPs: rejected",
+			trustedIssuer: mcpv1beta1.TrustedIssuerConfig{
+				IssuerURL:        "https://127.0.0.1",
+				ExpectedAudience: "aud",
+			},
+			wantErr: true,
+		},
+		{
+			name: "private-IP jwksUrl without allowPrivateIPs: rejected",
+			trustedIssuer: mcpv1beta1.TrustedIssuerConfig{
+				IssuerURL:        "https://idp.example.com",
+				ExpectedAudience: "aud",
+				JWKSURL:          "https://10.0.0.5/jwks",
+			},
+			wantErr: true,
+		},
+		{
+			name: "private-IP issuerUrl with allowPrivateIPs: accepted",
+			trustedIssuer: mcpv1beta1.TrustedIssuerConfig{
+				IssuerURL:        "https://10.0.0.5",
+				ExpectedAudience: "aud",
+				JWKSURL:          "https://10.0.0.5/jwks",
+				AllowPrivateIPs:  true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			vmcp := v1beta1test.NewVirtualMCPServer(testVmcpName, "default",
+				v1beta1test.WithVMCPGroupRef("test-group"),
+				v1beta1test.WithVMCPAuthServerConfig(&mcpv1beta1.EmbeddedAuthServerConfig{
+					Issuer:            "https://authserver.example.com",
+					UpstreamProviders: validUpstreams,
+					TrustedIssuers:    []mcpv1beta1.TrustedIssuerConfig{tt.trustedIssuer},
+				}),
+				v1beta1test.MutateVMCP(func(v *mcpv1beta1.VirtualMCPServer) {
+					v.Generation = 1
+				}),
+			)
+
+			r := &VirtualMCPServerReconciler{}
+			statusManager := virtualmcpserverstatus.NewStatusManager(vmcp)
+			err := r.validateAuthServerConfig(vmcp, statusManager)
+			statusManager.UpdateStatus(t.Context(), &vmcp.Status)
+
+			cond := findCondition(vmcp.Status.Conditions, mcpv1beta1.ConditionTypeAuthServerConfigValidated)
+			require.NotNil(t, cond, "AuthServerConfigValidated condition must be set")
+
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Equal(t, metav1.ConditionFalse, cond.Status)
+				assert.Equal(t, mcpv1beta1.ConditionReasonAuthServerConfigInvalid, cond.Reason)
+				assert.Contains(t, cond.Message, "allowPrivateIPs",
+					"rejection message must guide the user to the fix")
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, metav1.ConditionTrue, cond.Status)
+			}
+		})
+	}
+}
