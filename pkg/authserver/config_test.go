@@ -752,7 +752,7 @@ func TestConfigApplyDefaults_DelegationTokenLifespan(t *testing.T) {
 }
 
 // TestConfigValidate_TrustedIssuers covers validateTrustedIssuers as reached
-// from Config.Validate: the URL-shape checks (validateIssuerURL on
+// from Config.Validate: the URL-shape checks (validateTrustedIssuerURL on
 // issuer_url, validateJWKSEndpointURL on jwks_url) and the structural checks
 // delegated to tokenexchange.ValidateTrustedIssuers.
 func TestConfigValidate_TrustedIssuers(t *testing.T) {
@@ -820,9 +820,23 @@ func TestConfigValidate_TrustedIssuers(t *testing.T) {
 			},
 		},
 		{
-			name: "issuer_url http localhost accepted without any insecure flag",
+			// Unlike Config.Issuer, a trusted issuer gets no localhost
+			// exemption: it isn't this server's own issuer, so the same
+			// same-host development convenience doesn't apply — see
+			// validateTrustedIssuerURL's doc comment. Without
+			// insecure_allow_http, http://localhost must be rejected here
+			// the same as any other http issuer_url.
+			name: "issuer_url http localhost rejected without per-issuer insecure_allow_http",
 			issuers: []tokenexchange.TrustedIssuer{
 				{IssuerURL: "http://localhost:8080", ExpectedAudience: "https://mcp.example.com"},
+			},
+			wantErr: true,
+			errMsg:  "http scheme is only allowed for localhost",
+		},
+		{
+			name: "issuer_url http localhost accepted with per-issuer insecure_allow_http",
+			issuers: []tokenexchange.TrustedIssuer{
+				{IssuerURL: "http://localhost:8080", ExpectedAudience: "https://mcp.example.com", InsecureAllowHTTP: true},
 			},
 		},
 		{

@@ -874,19 +874,25 @@ func (c *Config) validateDelegationTokenLifespan() error {
 // restart. NewMultiIssuerTokenValidator still repeats all of this at server
 // startup as defence in depth.
 //
-// IssuerURL is an OIDC issuer identifier, so it is held to the same rules as
-// the server's own Issuer via validateIssuerURL (https, or http when the
-// issuer's own InsecureAllowHTTP permits it — including its localhost
-// exception; no query, fragment, or trailing slash). JWKSURL, when set, is
-// an ordinary endpoint URL rather than an issuer identifier — real-world
-// jwks_uri values legitimately carry a query string (e.g. Azure AD B2C's
-// includes "?p=...") — so it is checked by validateJWKSEndpointURL instead,
-// which has no localhost exception and also rejects a private/loopback IP
-// literal unless the issuer's own AllowPrivateIPs permits it: failing at
-// config time beats failing on the first token exchange.
+// IssuerURL is an OIDC issuer identifier, so it is held to nearly the same
+// rules as the server's own Issuer via validateTrustedIssuerURL (https, or
+// http when the issuer's own InsecureAllowHTTP permits it; no query,
+// fragment, or trailing slash) — except that, unlike validateIssuerURL, a
+// loopback host gets NO free pass on scheme: a trusted issuer is not this
+// server's own issuer, and exempting it from HTTPS the way the self-issuer
+// development convenience does would let "issuer_url: http://localhost:9000"
+// with insecure_allow_http: false pass here yet fail at runtime, since the
+// per-issuer HTTP client is still built with InsecureAllowHTTP=false — see
+// validateTrustedIssuerURL's doc comment. JWKSURL, when set, is an ordinary
+// endpoint URL rather than an issuer identifier — real-world jwks_uri values
+// legitimately carry a query string (e.g. Azure AD B2C's includes "?p=...")
+// — so it is checked by validateJWKSEndpointURL instead, which also rejects
+// a private/loopback IP literal unless the issuer's own AllowPrivateIPs
+// permits it: failing at config time beats failing on the first token
+// exchange.
 func validateTrustedIssuers(issuers []tokenexchange.TrustedIssuer, selfIssuer string) error {
 	for _, ti := range issuers {
-		if err := validateIssuerURL(ti.IssuerURL, ti.InsecureAllowHTTP); err != nil {
+		if err := validateTrustedIssuerURL(ti.IssuerURL, ti.InsecureAllowHTTP); err != nil {
 			return fmt.Errorf("trusted_issuers: issuer_url %q: %w", ti.IssuerURL, err)
 		}
 		if ti.JWKSURL != "" {
@@ -1208,6 +1214,26 @@ func (c *Config) applyDefaults() error {
 // When insecureAllowHTTP is true, http:// is also permitted for non-localhost
 // hosts (for in-cluster Kubernetes deployments on trusted networks).
 func validateIssuerURL(issuer string, insecureAllowHTTP bool) error {
+	return validateIssuerURLCore(issuer, insecureAllowHTTP, true)
+}
+
+// validateTrustedIssuerURL is like validateIssuerURL but never exempts
+// localhost from the HTTPS requirement: a trusted external issuer is not
+// this server's own issuer, so it must not inherit the same-host
+// development convenience validateIssuerURL grants the server's own issuer
+// and AuthorizationEndpointBaseURL. Without this, "issuer_url:
+// http://localhost:9000" with insecure_allow_http: false would pass config
+// validation here yet fail at runtime, since the per-issuer HTTP client is
+// still built with InsecureAllowHTTP=false (see NewMultiIssuerTokenValidator)
+// — jwks_url has no such exemption, so the two would otherwise disagree.
+func validateTrustedIssuerURL(issuer string, insecureAllowHTTP bool) error {
+	return validateIssuerURLCore(issuer, insecureAllowHTTP, false)
+}
+
+// validateIssuerURLCore is the shared implementation behind validateIssuerURL
+// and validateTrustedIssuerURL. localhostExempt controls whether a loopback
+// host is treated as HTTPS-exempt regardless of insecureAllowHTTP.
+func validateIssuerURLCore(issuer string, insecureAllowHTTP, localhostExempt bool) error {
 	if issuer == "" {
 		return fmt.Errorf("issuer is required")
 	}
@@ -1233,13 +1259,13 @@ func validateIssuerURL(issuer string, insecureAllowHTTP bool) error {
 		return fmt.Errorf("must not contain fragment component")
 	}
 
-	// HTTPS is required unless it's a loopback address (for development) or
-	// insecureAllowHTTP is explicitly set for trusted in-cluster deployments.
+	// HTTPS is required unless it's a loopback address (for development, and
+	// only when localhostExempt) or insecureAllowHTTP is explicitly set.
 	if parsed.Scheme != "https" {
 		if parsed.Scheme != "http" {
 			return fmt.Errorf("scheme must be https (or http for localhost)")
 		}
-		if !networking.IsLocalhost(parsed.Host) && !insecureAllowHTTP {
+		if !insecureAllowHTTP && !(localhostExempt && networking.IsLocalhost(parsed.Host)) {
 			return fmt.Errorf("http scheme is only allowed for localhost, use https for %s", parsed.Hostname())
 		}
 	}
