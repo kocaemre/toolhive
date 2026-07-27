@@ -142,12 +142,14 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				IssuerURL:        testExternalIssuer,
 				ExpectedAudience: testExternalAudience,
 				JWKSURL:          jwksServer.URL + "/jwks",
+				AllowedActors:    []string{"ext-agent"},
 			}},
 			token: func(t *testing.T) string {
 				t.Helper()
 				return externalJWKS.signToken(t, externalClaims(), map[string]interface{}{
 					"name":  "External User",
 					"email": "ext@keycloak.example.com",
+					"azp":   "ext-agent",
 				})
 			},
 			check: func(t *testing.T, vc *ValidatedClaims) {
@@ -308,6 +310,7 @@ func TestMultiIssuerTokenValidator_OIDCDiscovery(t *testing.T) {
 	trustedIssuers := []TrustedIssuer{{
 		IssuerURL:        discoveryServer.URL,
 		ExpectedAudience: testExternalAudience,
+		AllowedActors:    []string{"ext-agent"},
 		// JWKSURL intentionally left empty to trigger discovery.
 	}}
 
@@ -323,7 +326,7 @@ func TestMultiIssuerTokenValidator_OIDCDiscovery(t *testing.T) {
 		NotBefore: jwt.NewNumericDate(time.Now().Add(-time.Minute)),
 		ID:        "jti-disc-001",
 	}
-	rawToken := externalJWKS.signToken(t, claims, nil)
+	rawToken := externalJWKS.signToken(t, claims, map[string]any{"azp": "ext-agent"})
 
 	result, err := validator.Validate(context.Background(), rawToken)
 	require.NoError(t, err)
@@ -353,6 +356,7 @@ func TestMultiIssuerTokenValidator_JWKSCaching(t *testing.T) {
 		IssuerURL:        testExternalIssuer,
 		ExpectedAudience: testExternalAudience,
 		JWKSURL:          jwksServer.URL + "/jwks",
+		AllowedActors:    []string{"ext-agent"},
 	}}
 
 	validator := newMultiValidator(t, selfJWKS, trustedIssuers)
@@ -361,7 +365,7 @@ func TestMultiIssuerTokenValidator_JWKSCaching(t *testing.T) {
 	for i := range 2 {
 		claims := externalClaims()
 		claims.ID = fmt.Sprintf("jti-cache-%d", i)
-		rawToken := externalJWKS.signToken(t, claims, nil)
+		rawToken := externalJWKS.signToken(t, claims, map[string]any{"azp": "ext-agent"})
 
 		result, err := validator.Validate(context.Background(), rawToken)
 		require.NoError(t, err)

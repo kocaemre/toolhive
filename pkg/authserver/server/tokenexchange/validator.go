@@ -8,6 +8,7 @@ package tokenexchange
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -56,6 +57,16 @@ type ValidatedClaims struct {
 	// MayAct holds the authorized actor from the "may_act" claim (RFC 8693 §4.1).
 	// Nil when the subject token does not carry a may_act claim.
 	MayAct *MayActClaim
+	// ExternalActor is the client identity that the external-issuer validation
+	// path has already authorized for delegation, via a per-issuer actor-claim
+	// allowlist match. It is set ONLY by that path (multi_issuer_validator.go),
+	// after the resolved actor claim is confirmed present in the issuer's
+	// AllowedActors — never populated from token claims by buildValidatedClaims
+	// or assignClaim. It is empty for self-issued tokens and for external
+	// tokens that carry a may_act claim (may_act is authoritative there
+	// instead). A non-empty value means the validator has already authorized
+	// this token's actor for delegation; it is not itself a raw claim.
+	ExternalActor string
 	// Extra contains all non-standard claims not captured by other fields.
 	Extra map[string]any
 }
@@ -154,18 +165,11 @@ func (v *SelfIssuedTokenValidator) Validate(_ context.Context, rawToken string) 
 		return nil, fmt.Errorf("subject token is missing required 'sub' claim")
 	}
 
-	// If may_act is present, it must be a well-formed object with a string sub.
-	// A present-but-malformed may_act is treated as an invalid token, not
-	// an absent one — fail closed to prevent silent downgrade to client_id.
-	if rawMayAct, ok := extraClaims["may_act"]; ok && rawMayAct != nil {
-		m, ok := rawMayAct.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("subject token has malformed 'may_act' claim: expected a JSON object")
-		}
-		sub, ok := m["sub"].(string)
-		if !ok || sub == "" {
-			return nil, fmt.Errorf("subject token has malformed 'may_act' claim: missing or invalid 'sub'")
-		}
+	// If may_act is present, it must be well-formed. A present-but-malformed
+	// may_act is treated as an invalid token, not an absent one — fail closed
+	// to prevent silent downgrade to client_id.
+	if err := validateMayActShape(extraClaims); err != nil {
+		return nil, err
 	}
 
 	return buildValidatedClaims(standardClaims, extraClaims), nil
@@ -255,6 +259,7 @@ func buildValidatedClaims(
 // ValidatedClaims field, or into Extra if it isn't a well-known claim.
 // Registered JWT claims (sub, iss, aud, exp, iat, nbf, jti) are dropped —
 // they're already captured in buildValidatedClaims's structured fields.
+// Keep actorClaimsNotInExtra (multi_issuer_validator.go) in sync with the cases here.
 func assignClaim(vc *ValidatedClaims, key string, val any) {
 	switch key {
 	case "name":
@@ -284,4 +289,27 @@ func assignClaim(vc *ValidatedClaims, key string, val any) {
 	default:
 		vc.Extra[key] = val
 	}
+}
+
+// validateMayActShape rejects a present-but-malformed may_act claim. Both
+// validation paths (self-issued here, external in multi_issuer_validator.go)
+// call this before buildValidatedClaims: assignClaim silently drops a
+// malformed may_act rather than surfacing it, and each path's fallback
+// consent signal when may_act is absent (client_id here, the actor allowlist
+// externally) is weaker than what a well-formed may_act would have granted.
+// Letting a malformed claim fall through would silently widen consent
+// instead of rejecting the token.
+func validateMayActShape(extra map[string]any) error {
+	raw, ok := extra["may_act"]
+	if !ok || raw == nil {
+		return nil
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return errors.New("subject token has malformed 'may_act' claim: expected a JSON object")
+	}
+	if sub, ok := m["sub"].(string); !ok || sub == "" {
+		return errors.New("subject token has malformed 'may_act' claim: missing or invalid 'sub'")
+	}
+	return nil
 }

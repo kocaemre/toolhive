@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sync"
 	"time"
 
@@ -39,7 +41,30 @@ const (
 
 	// maxRedirects caps redirects followed when fetching external OIDC metadata.
 	maxRedirects = 5
+
+	// defaultActorClaim is the claim read to identify the client that
+	// requested an external subject token, when a TrustedIssuer does not
+	// configure ActorClaim. This matches Microsoft Entra v2 and many other
+	// OIDC providers' convention for the authorized-party claim.
+	defaultActorClaim = "azp"
+
+	// externalClockSkewLeeway widens "nbf"/"iat"/"exp" acceptance for external
+	// subject tokens to tolerate clock skew between the external IdP and
+	// ToolHive. validateExternalToken independently rejects an expired
+	// subject token by comparing its exp against time.Now() with zero
+	// tolerance, so this leeway only protects against spurious
+	// not-yet-valid/issued-in-the-future rejections — it never causes an
+	// expired token to be accepted.
+	externalClockSkewLeeway = 60 * time.Second
 )
+
+// actorClaimsNotInExtra are claims assignClaim drops or reroutes, so they
+// never reach ValidatedClaims.Extra. Only "client_id" has an explicit
+// fallback in resolveAllowedActor; configuring ActorClaim to any of these
+// would make every external token look like it's missing the claim.
+var actorClaimsNotInExtra = []string{
+	"sub", "iss", "aud", "exp", "iat", "nbf", "jti", "name", "email", "scope", "may_act",
+}
 
 // Compile-time check that MultiIssuerTokenValidator implements SubjectTokenValidator.
 var _ SubjectTokenValidator = (*MultiIssuerTokenValidator)(nil)
@@ -48,14 +73,37 @@ var _ SubjectTokenValidator = (*MultiIssuerTokenValidator)(nil)
 // accepted as subject tokens during token exchange.
 type TrustedIssuer struct {
 	// IssuerURL is the expected "iss" claim value (exact match).
-	IssuerURL string
+	IssuerURL string `json:"issuer_url" yaml:"issuer_url"`
 	// ExpectedAudience is the expected "aud" claim value that must appear
 	// in the token's audience list. Required; NewMultiIssuerTokenValidator
 	// rejects any TrustedIssuer with an empty ExpectedAudience.
-	ExpectedAudience string
+	ExpectedAudience string `json:"expected_audience" yaml:"expected_audience"`
 	// JWKSURL is the URL to fetch the issuer's JSON Web Key Set from.
 	// If empty, it is resolved via OIDC discovery at {IssuerURL}/.well-known/openid-configuration.
-	JWKSURL string
+	JWKSURL string `json:"jwks_url,omitempty" yaml:"jwks_url,omitempty"`
+	// ActorClaim names the claim that identifies the client that requested the
+	// subject token from THIS EXTERNAL ISSUER, used for the AllowedActors consent
+	// check below. Values are in the external issuer's client namespace — they are
+	// NOT ToolHive client IDs, and listing a ToolHive client ID in AllowedActors
+	// does not bind delegation to that client (see AllowedActors). Defaults to
+	// "azp" when empty. Set to "appid" for Microsoft Entra v1 tokens, or "cid"
+	// for Okta tokens. The special value "client_id" reads ValidatedClaims.ClientID
+	// instead of Extra, since that claim is routed to a structured field rather
+	// than left in Extra — it is still the external token's client_id claim, not
+	// a ToolHive one.
+	ActorClaim string `json:"actor_claim,omitempty" yaml:"actor_claim,omitempty"`
+	// AllowedActors is the allowlist of ActorClaim values authorized to
+	// exchange a subject token from this issuer, when the token does not
+	// carry a "may_act" claim. Empty means only may_act-bearing tokens from
+	// this issuer are accepted — every other token from it is rejected
+	// (mirrors the empty-AllowedAudiences convention documented on
+	// NewSelfIssuedTokenValidator).
+	//
+	// Accepted limitation: an allowlisted actor satisfies consent for ANY
+	// ToolHive confidential client holding the token-exchange grant. The
+	// allowlist authorizes "this external client's tokens may be exchanged
+	// here", not "...by this particular ToolHive client".
+	AllowedActors []string `json:"allowed_actors,omitempty" yaml:"allowed_actors,omitempty"`
 }
 
 // MultiIssuerTokenValidator validates subject tokens from the authorization
@@ -66,12 +114,13 @@ type TrustedIssuer struct {
 // issuers, the validator resolves the issuer's JWKS (via OIDC discovery if needed),
 // verifies the JWT signature, and validates standard claims.
 //
-// TODO(#5989): this validator is not yet wired into Factory (which still
-// constructs a SelfIssuedTokenValidator), so external subject tokens are not
-// reachable in production. External tokens carry no client_id claim, so the
-// handler's checkDelegationConsent fails them closed. The external-token
-// delegation-consent policy MUST land in the same change that wires this
-// validator into Factory — do not enable external issuers without it.
+// External subject tokens carry no client_id claim, so a valid signature and
+// audience alone would authorize ToolHive as a resource, not any particular
+// client, as a delegate — a confused-deputy risk (CWE-863). validateExternalToken
+// therefore requires one of two consent signals before returning successfully:
+// a "may_act" claim (authoritative; enforced by the caller against the
+// authenticated client), or the issuer's configured actor claim matching an
+// entry in that issuer's AllowedActors.
 type MultiIssuerTokenValidator struct {
 	selfIssuer    string
 	selfValidator *SelfIssuedTokenValidator
@@ -86,7 +135,11 @@ type MultiIssuerTokenValidator struct {
 }
 
 // externalIssuerConfig holds the configuration and cached state for an external
-// OIDC issuer. The mutex protects lazy JWKS URL discovery and JWKS caching.
+// OIDC issuer. The embedded TrustedIssuer is treated as immutable after
+// construction: resolveAllowedActor reads TrustedIssuer.AllowedActors on every
+// validation without holding mu, since mu protects JWKS state only. Mutating
+// TrustedIssuer fields in place after NewMultiIssuerTokenValidator returns is a
+// data race.
 type externalIssuerConfig struct {
 	TrustedIssuer
 
@@ -98,20 +151,41 @@ type externalIssuerConfig struct {
 
 // NewMultiIssuerTokenValidator creates a validator that accepts tokens from the
 // authorization server itself and from the provided list of trusted external issuers.
-// Returns an error if any TrustedIssuer has an empty ExpectedAudience.
+// Returns an error if selfValidator is nil, selfIssuer is empty, or any TrustedIssuer
+// is invalid: empty IssuerURL or ExpectedAudience, an IssuerURL equal to selfIssuer
+// or duplicated across entries, or an ActorClaim naming a claim assignClaim never
+// leaves in Extra (see actorClaimsNotInExtra).
 func NewMultiIssuerTokenValidator(
 	selfValidator *SelfIssuedTokenValidator,
 	selfIssuer string,
 	trustedIssuers []TrustedIssuer,
 ) (*MultiIssuerTokenValidator, error) {
-	for _, issuer := range trustedIssuers {
-		if issuer.ExpectedAudience == "" {
-			return nil, fmt.Errorf("trusted issuer %q: ExpectedAudience is required", issuer.IssuerURL)
-		}
+	if selfValidator == nil {
+		return nil, errors.New("selfValidator must not be nil")
+	}
+	if selfIssuer == "" {
+		return nil, errors.New("selfIssuer must not be empty")
 	}
 
 	issuers := make(map[string]*externalIssuerConfig, len(trustedIssuers))
 	for _, ti := range trustedIssuers {
+		if err := validateTrustedIssuer(ti, selfIssuer, issuers); err != nil {
+			return nil, err
+		}
+		if len(ti.AllowedActors) == 0 {
+			slog.Warn("Trusted issuer has no allowed actors configured; "+
+				"only may_act-bearing subject tokens from it will be accepted",
+				"issuer", ti.IssuerURL,
+			)
+		}
+
+		// Clone AllowedActors so a caller mutating its original slice in place
+		// (e.g. a future config reload) cannot race with the unsynchronized
+		// reads in resolveAllowedActor, which is called on every validation
+		// without holding externalIssuerConfig.mu (that mutex guards JWKS
+		// state only).
+		ti.AllowedActors = slices.Clone(ti.AllowedActors)
+
 		issuers[ti.IssuerURL] = &externalIssuerConfig{
 			TrustedIssuer: ti,
 			jwksURL:       ti.JWKSURL,
@@ -208,13 +282,13 @@ func (v *MultiIssuerTokenValidator) validateExternalToken(
 		return nil, err
 	}
 
-	// Validate standard claims: issuer must match, audience must contain the expected value,
-	// and the token must not be expired.
+	// Validate issuer and audience, tolerating externalClockSkewLeeway on
+	// nbf/iat/exp. Expiry is enforced strictly (no leeway) below.
 	expected := jwt.Expected{
 		Issuer:      issuerConfig.IssuerURL,
 		AnyAudience: jwt.Audience{issuerConfig.ExpectedAudience},
 	}
-	if err := standardClaims.ValidateWithLeeway(expected, 0); err != nil {
+	if err := standardClaims.ValidateWithLeeway(expected, externalClockSkewLeeway); err != nil {
 		return nil, fmt.Errorf("subject token claims validation failed: %w", err)
 	}
 
@@ -229,7 +303,35 @@ func (v *MultiIssuerTokenValidator) validateExternalToken(
 		return nil, errors.New("subject token is missing required 'exp' claim")
 	}
 
-	return buildValidatedClaims(standardClaims, extraClaims), nil
+	// Leeway above tolerates clock skew on nbf/iat, but an expired subject
+	// token is never acceptable: it cannot bound the delegated token's
+	// lifetime.
+	if standardClaims.Expiry.Time().Before(time.Now()) {
+		return nil, errors.New("subject token has expired")
+	}
+
+	// If may_act is present, it must be well-formed — see validateMayActShape.
+	if err := validateMayActShape(extraClaims); err != nil {
+		return nil, err
+	}
+
+	claims := buildValidatedClaims(standardClaims, extraClaims)
+
+	// Delegation consent for the external path: a may_act claim is
+	// authoritative and is enforced by the caller (checkDelegationConsent)
+	// against the authenticated client, so nothing further is required here.
+	// Otherwise, the resolved actor claim must be present in this issuer's
+	// AllowedActors — this is the only consent signal available for tokens
+	// without may_act, since external tokens carry no client_id claim.
+	if claims.MayAct == nil {
+		actor, err := resolveAllowedActor(issuerConfig, claims)
+		if err != nil {
+			return nil, err
+		}
+		claims.ExternalActor = actor
+	}
+
+	return claims, nil
 }
 
 // resolveJWKS returns the cached JWKS for an external issuer, fetching it if
@@ -409,4 +511,67 @@ func (v *MultiIssuerTokenValidator) fetchJWKS(ctx context.Context, jwksURL strin
 	}
 
 	return &jwks, nil
+}
+
+// validateTrustedIssuer checks a single TrustedIssuer for structural validity
+// before it is admitted into issuers: required fields, no collision with
+// selfIssuer or an already-registered issuer, and an ActorClaim that
+// resolveAllowedActor can actually read from Extra (or ClientID).
+func validateTrustedIssuer(ti TrustedIssuer, selfIssuer string, issuers map[string]*externalIssuerConfig) error {
+	if ti.IssuerURL == "" {
+		return errors.New("trusted issuer: IssuerURL is required")
+	}
+	if ti.ExpectedAudience == "" {
+		return fmt.Errorf("trusted issuer %q: ExpectedAudience is required", ti.IssuerURL)
+	}
+	if ti.IssuerURL == selfIssuer {
+		return fmt.Errorf("trusted issuer %q: must not equal selfIssuer; "+
+			"self-issued tokens are already handled separately", ti.IssuerURL)
+	}
+	if _, dup := issuers[ti.IssuerURL]; dup {
+		return fmt.Errorf("trusted issuer %q: configured more than once", ti.IssuerURL)
+	}
+	if ti.ActorClaim != "" && slices.Contains(actorClaimsNotInExtra, ti.ActorClaim) {
+		return fmt.Errorf(
+			"trusted issuer %q: ActorClaim %q is not supported "+
+				`(use "client_id" or a non-registered claim such as "azp", "appid", "cid")`,
+			ti.IssuerURL, ti.ActorClaim)
+	}
+	return nil
+}
+
+// resolveAllowedActor resolves the issuer's configured actor claim from
+// claims and checks it against issuerConfig.AllowedActors, returning the
+// matched value on success. Called only when the subject token carries no
+// may_act claim — see validateExternalToken.
+func resolveAllowedActor(issuerConfig *externalIssuerConfig, claims *ValidatedClaims) (string, error) {
+	claimName := issuerConfig.ActorClaim
+	if claimName == "" {
+		claimName = defaultActorClaim
+	}
+
+	// "client_id" is routed to ValidatedClaims.ClientID by assignClaim, so it
+	// never appears in Extra; without this fallback a plausible operator
+	// config (ActorClaim: "client_id") would silently reject all traffic.
+	var raw any
+	if claimName == "client_id" {
+		raw = claims.ClientID
+	} else {
+		raw = claims.Extra[claimName]
+	}
+
+	actor, ok := raw.(string)
+	if !ok || actor == "" {
+		return "", fmt.Errorf(
+			"subject token from issuer %q is missing or has an invalid %q claim required for delegation consent",
+			issuerConfig.IssuerURL, claimName)
+	}
+
+	if !slices.Contains(issuerConfig.AllowedActors, actor) {
+		return "", fmt.Errorf(
+			"subject token from issuer %q names actor %q in claim %q, which is not in the allowed actors list",
+			issuerConfig.IssuerURL, actor, claimName)
+	}
+
+	return actor, nil
 }
