@@ -127,6 +127,12 @@ Welcome to the ToolHive architecture documentation. This directory contains comp
     - Dynamic forward proxy with per-request DNS and native HTTPS CONNECT tunnelling
     - Squid-vs-Envoy comparison and known limitations (`AllowPort` gap, V4_ONLY DNS, deny-all on empty profile)
 
+16. **[External Subject-Token Exchange (Delegation)](16-token-exchange-delegation.md)**
+    - `trustedIssuers`: accepting subject tokens from an external OIDC issuer during RFC 8693 token exchange
+    - Confused-deputy trust model and the `may_act` / allowlist consent signals
+    - Accepted limitations: client-set equivalence, subject-namespace disjointness, partial provenance
+    - Operational gotchas: audience/scope binding, discovery redirects, JWKS caching, diagnostics
+
 ### Existing Documentation
 
 For middleware architecture, see: **[docs/middleware.md](../middleware.md)**

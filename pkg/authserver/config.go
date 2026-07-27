@@ -139,15 +139,16 @@ type RunConfig struct {
 	//     invalid_target on every call. The external path only works if the
 	//     operator configures the external IdP's API identifier to be exactly
 	//     one of ToolHive's AllowedAudiences URIs.
-	//  2. Scopes: the handler intersects the client's registered scopes with
-	//     the subject token's "scope" claim. A subject token with no "scope"
-	//     claim grants a zero-scope delegated token — correct and fail-closed,
-	//     but easy to mistake for a bug on first use. Microsoft Entra v2
-	//     access tokens carry scopes under "scp", not "scope" — the JWT
-	//     claim handling is unchanged by this document, so an Entra subject
-	//     token hits this same zero-scope case even when it does carry
-	//     scopes. Worth expecting up front, since Entra is also the provider
-	//     tokenexchange.TrustedIssuer's ActorClaim default ("azp") targets.
+	//  2. Scopes: the handler rejects any requested scope absent from the
+	//     subject token's "scope" claim with invalid_scope — it does not
+	//     intersect down to a reduced grant. A subject token with no "scope"
+	//     claim therefore rejects every scoped request; only a scopeless
+	//     request succeeds. Microsoft Entra v2 access tokens carry scopes
+	//     under "scp", not "scope" — the JWT claim handling is unchanged by
+	//     this document, so an Entra subject token hits this same case even
+	//     when it does carry scopes. Worth expecting up front, since Entra is
+	//     also the provider tokenexchange.TrustedIssuer's ActorClaim default
+	//     ("azp") targets.
 	//  3. Subject namespace: a trusted issuer is trusted to assert ANY
 	//     subject this server will accept for delegation — the delegated
 	//     token carries ToolHive's own "iss" with the external token's "sub"

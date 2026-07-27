@@ -660,13 +660,13 @@ spec:
                             fails with invalid_target on every call unless the external IdP's API
                             identifier is configured to be exactly one of this server's allowed
                             audiences (see expectedAudience below for how to set it).
-                         2. Scopes: the handler intersects the client's registered scopes with the
-                            subject token's "scope" claim. A subject token without a "scope" claim
-                            yields a zero-scope delegated token — correct and fail-closed, but easy
-                            to mistake for a bug on first use. Microsoft Entra v2 access tokens
-                            carry scopes under "scp", not "scope" — this claim handling does not
-                            read "scp", so an Entra subject token hits the same zero-scope case
-                            even though it does carry scopes.
+                         2. Scopes: the handler rejects any requested scope absent from the subject
+                            token's "scope" claim with invalid_scope — it does not intersect down
+                            to a reduced grant. A subject token without a "scope" claim therefore
+                            rejects every scoped request; only a scopeless request succeeds.
+                            Microsoft Entra v2 access tokens carry scopes under "scp", not
+                            "scope" — this claim handling does not read "scp", so an Entra
+                            subject token hits the same case even though it does carry scopes.
                          3. Subject namespace: a trusted issuer is trusted to assert ANY subject
                             this server accepts for delegation — the delegated token carries this
                             server's own "iss" with the external token's "sub" copied verbatim and
@@ -2442,13 +2442,13 @@ spec:
                             fails with invalid_target on every call unless the external IdP's API
                             identifier is configured to be exactly one of this server's allowed
                             audiences (see expectedAudience below for how to set it).
-                         2. Scopes: the handler intersects the client's registered scopes with the
-                            subject token's "scope" claim. A subject token without a "scope" claim
-                            yields a zero-scope delegated token — correct and fail-closed, but easy
-                            to mistake for a bug on first use. Microsoft Entra v2 access tokens
-                            carry scopes under "scp", not "scope" — this claim handling does not
-                            read "scp", so an Entra subject token hits the same zero-scope case
-                            even though it does carry scopes.
+                         2. Scopes: the handler rejects any requested scope absent from the subject
+                            token's "scope" claim with invalid_scope — it does not intersect down
+                            to a reduced grant. A subject token without a "scope" claim therefore
+                            rejects every scoped request; only a scopeless request succeeds.
+                            Microsoft Entra v2 access tokens carry scopes under "scp", not
+                            "scope" — this claim handling does not read "scp", so an Entra
+                            subject token hits the same case even though it does carry scopes.
                          3. Subject namespace: a trusted issuer is trusted to assert ANY subject
                             this server accepts for delegation — the delegated token carries this
                             server's own "iss" with the external token's "sub" copied verbatim and

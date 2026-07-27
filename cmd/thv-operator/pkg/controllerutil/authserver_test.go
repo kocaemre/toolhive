@@ -1644,6 +1644,107 @@ func TestBuildAuthServerRunConfig(t *testing.T) {
 					"InsecureAllowHTTP false must propagate from CRD field to RunConfig")
 			},
 		},
+		{
+			name: "trustedIssuers omitted produces nil RunConfig.TrustedIssuers",
+			authConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://auth.example.com",
+				HMACSecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "hmac-secret", Key: "hmac"},
+				},
+			},
+			allowedAudiences: defaultAudiences,
+			scopesSupported:  defaultScopes,
+			checkFunc: func(t *testing.T, config *authserver.RunConfig) {
+				t.Helper()
+				assert.Nil(t, config.TrustedIssuers,
+					"omitting trustedIssuers must produce a RunConfig identical to one from before the field existed")
+			},
+		},
+		{
+			name: "single trusted issuer with all fields set maps every field",
+			authConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://auth.example.com",
+				HMACSecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "hmac-secret", Key: "hmac"},
+				},
+				TrustedIssuers: []mcpv1beta1.TrustedIssuerConfig{
+					{
+						IssuerURL:        "https://external-idp.example.com",
+						ExpectedAudience: "api://my-app-id",
+						JWKSURL:          "https://external-idp.example.com/keys",
+						ActorClaim:       "appid",
+						AllowedActors:    []string{"actor-1", "actor-2"},
+						AllowPrivateIPs:  true,
+					},
+				},
+			},
+			allowedAudiences: defaultAudiences,
+			scopesSupported:  defaultScopes,
+			checkFunc: func(t *testing.T, config *authserver.RunConfig) {
+				t.Helper()
+				require.Len(t, config.TrustedIssuers, 1)
+				ti := config.TrustedIssuers[0]
+				assert.Equal(t, "https://external-idp.example.com", ti.IssuerURL)
+				assert.Equal(t, "api://my-app-id", ti.ExpectedAudience)
+				assert.Equal(t, "https://external-idp.example.com/keys", ti.JWKSURL)
+				assert.Equal(t, "appid", ti.ActorClaim)
+				assert.Equal(t, []string{"actor-1", "actor-2"}, ti.AllowedActors)
+				assert.True(t, ti.AllowPrivateIPs)
+				// No CRD field exists for InsecureAllowHTTP, so this only pins
+				// the zero value; the actual invariant (a trusted issuer gets
+				// no localhost HTTPS exemption) is enforced and tested at
+				// pkg/authserver/config_test.go:809-841.
+				assert.False(t, ti.InsecureAllowHTTP)
+			},
+		},
+		{
+			name: "multiple trusted issuers preserve order",
+			authConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://auth.example.com",
+				HMACSecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "hmac-secret", Key: "hmac"},
+				},
+				TrustedIssuers: []mcpv1beta1.TrustedIssuerConfig{
+					{IssuerURL: "https://idp-a.example.com", ExpectedAudience: "aud-a"},
+					{IssuerURL: "https://idp-b.example.com", ExpectedAudience: "aud-b"},
+					{IssuerURL: "https://idp-c.example.com", ExpectedAudience: "aud-c"},
+				},
+			},
+			allowedAudiences: defaultAudiences,
+			scopesSupported:  defaultScopes,
+			checkFunc: func(t *testing.T, config *authserver.RunConfig) {
+				t.Helper()
+				require.Len(t, config.TrustedIssuers, 3)
+				assert.Equal(t, "https://idp-a.example.com", config.TrustedIssuers[0].IssuerURL)
+				assert.Equal(t, "https://idp-b.example.com", config.TrustedIssuers[1].IssuerURL)
+				assert.Equal(t, "https://idp-c.example.com", config.TrustedIssuers[2].IssuerURL)
+			},
+		},
+		{
+			name: "trusted issuer with only required fields leaves optional fields zero-valued",
+			authConfig: &mcpv1beta1.EmbeddedAuthServerConfig{
+				Issuer: "https://auth.example.com",
+				HMACSecretRefs: []mcpv1beta1.SecretKeyRef{
+					{Name: "hmac-secret", Key: "hmac"},
+				},
+				TrustedIssuers: []mcpv1beta1.TrustedIssuerConfig{
+					{IssuerURL: "https://external-idp.example.com", ExpectedAudience: "api://my-app-id"},
+				},
+			},
+			allowedAudiences: defaultAudiences,
+			scopesSupported:  defaultScopes,
+			checkFunc: func(t *testing.T, config *authserver.RunConfig) {
+				t.Helper()
+				require.Len(t, config.TrustedIssuers, 1)
+				ti := config.TrustedIssuers[0]
+				assert.Equal(t, "https://external-idp.example.com", ti.IssuerURL)
+				assert.Equal(t, "api://my-app-id", ti.ExpectedAudience)
+				assert.Empty(t, ti.JWKSURL)
+				assert.Empty(t, ti.ActorClaim)
+				assert.Nil(t, ti.AllowedActors)
+				assert.False(t, ti.AllowPrivateIPs)
+			},
+		},
 	}
 
 	for _, tt := range tests {
