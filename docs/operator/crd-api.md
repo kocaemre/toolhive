@@ -1923,6 +1923,7 @@ _Appears in:_
 | `insecureAllowHTTP` _boolean_ | InsecureAllowHTTP permits an http:// issuer URL for non-localhost hosts.<br />Only set this for in-cluster Kubernetes deployments where traffic between<br />pods traverses a trusted network (e.g. the in-cluster service mesh).<br />Production deployments reachable outside the cluster MUST use https://.<br />On VirtualMCPServer: when false (the default), http:// issuers for non-localhost<br />hosts are rejected at reconcile time with an AuthServerConfigValidated=False condition.<br />On MCPServer and MCPRemoteProxy (via MCPExternalAuthConfig): this field is<br />structurally present but enforcement is deferred to pod startup via Config.Validate();<br />a misconfigured issuer will cause the pod to crash at startup rather than surface<br />as an operator condition. | false | Optional: \{\} <br /> |
 | `baselineClientScopes` _string array_ | BaselineClientScopes is a baseline set of OAuth 2.0 scopes guaranteed to be<br />included in every client registration. The embedded auth server unions these<br />scopes into the registered set returned by RFC 7591 Dynamic Client<br />Registration, so a client that narrows the `scope` field at /oauth/register<br />can still request the baseline scopes at /oauth/authorize. All values must<br />be present in the upstream-derived scopesSupported set; the auth server<br />fails to start if any value is missing.<br />Security: every client registered via /oauth/register will gain the<br />ability to request these scopes at /oauth/authorize, regardless of what<br />the client itself requested. Keep the baseline narrow (typically<br />"openid" and "offline_access"). Adding a privileged scope here — e.g.<br />"admin:read" — would grant it to every DCR-registered client, including<br />public clients like Claude Code, Cursor, and VS Code.<br />When cimd.enabled is true, every dynamically resolved CIMD client will<br />also gain the ability to request these scopes, including third-party<br />clients resolved from arbitrary HTTPS URLs. |  | MaxItems: 10 <br />items:MinLength: 1 <br />items:Pattern: `^[\x21\x23-\x5B\x5D-\x7E]+$` <br />Optional: \{\} <br /> |
 | `cimd` _[api.v1beta1.EmbeddedAuthServerCIMDConfig](#apiv1beta1embeddedauthservercimdconfig)_ | CIMD configures Client ID Metadata Document support. When omitted, CIMD is disabled. |  | Optional: \{\} <br /> |
+| `trustedIssuers` _[api.v1beta1.TrustedIssuerConfig](#apiv1beta1trustedissuerconfig) array_ | TrustedIssuers lists external OIDC issuers whose tokens are accepted as<br />RFC 8693 subject tokens during token exchange, in addition to this<br />server's own self-issued tokens. Empty (the default) means only<br />self-issued subject tokens are accepted. See TrustedIssuerConfig for<br />the full field reference and the operator-facing audience/scope/<br />subject-namespace constraints that apply to every entry.<br />Enforcement of what this field and its admission-time checks cannot<br />express (an issuer_url's private-IP-literal shape, and the JWKS<br />discovery/fetch itself) is deferred to pod startup, mirroring<br />insecureAllowHTTP above: a misconfigured trusted issuer surfaces as a<br />pod crash or a first-token-exchange failure, not an operator condition. |  | MaxItems: 20 <br />Optional: \{\} <br /> |
 
 
 #### api.v1beta1.EmbeddingResourceOverrides
@@ -4252,6 +4253,82 @@ ToolRateLimitConfig defines rate limits for a specific tool.
 
 
 
+
+
+#### api.v1beta1.TrustedIssuerConfig
+
+
+
+TrustedIssuerConfig configures an external OIDC issuer whose tokens the
+embedded authorization server accepts as RFC 8693 subject tokens during
+token exchange, alongside its own self-issued tokens. Mirrors
+tokenexchange.TrustedIssuer (pkg/authserver/server/tokenexchange), which
+remains the authoritative field-level documentation for the token-exchange
+runtime semantics; this CRD type carries only the operator-facing subset
+of that struct.
+
+Deliberately omits tokenexchange.TrustedIssuer's InsecureAllowHTTP field:
+it disables HTTPS enforcement on discovery/JWKS fetches, so an on-path
+attacker able to intercept that traffic could substitute a JWKS and
+thereafter forge subject tokens with arbitrary subject and actor claims
+for this issuer. The operator-managed path is HTTPS-only with no escape
+hatch for that risk, by design — an operator that genuinely needs
+plaintext discovery must configure the authorization server via a
+hand-written authserver.RunConfig instead of this CRD.
+
+AllowPrivateIPs, by contrast, IS exposed below: with HTTPS still mandatory
+the JWKS fetch remains certificate-authenticated regardless of the peer's
+address, so it is an SSRF guard rather than an authenticity guard, and
+omitting it entirely would block mainstream in-cluster shapes (a
+ClusterIP-addressed IdP, an IdP behind a private endpoint) even with a
+valid public certificate.
+
+Enforcement of what this type and its admission-time checks cannot
+express — an issuer_url or jwks_url private-IP-literal shape, and the
+discovery/JWKS fetch itself — is deferred to pod startup / first token
+exchange, mirroring EmbeddedAuthServerConfig.InsecureAllowHTTP: a
+misconfigured trusted issuer surfaces as a pod crash or a runtime error,
+not an operator condition.
+
+Three constraints apply to every entry that are not visible from the shape
+below (see tokenexchange.TrustedIssuer and authserver.RunConfig.TrustedIssuers
+for the full rationale):
+
+ 1. Audience: the token-exchange handler bounds the requested audience by
+    the subject token's own "aud" claim. An external IdP's "aud" is
+    typically an app-ID GUID or "api://<app-id>", not an ordinary
+    "resource=https://mcp.example.com" URI, so a plain resource request
+    fails with invalid_target on every call unless the external IdP's API
+    identifier is configured to be exactly one of this server's allowed
+    audiences (see expectedAudience below for how to set it).
+ 2. Scopes: the handler intersects the client's registered scopes with the
+    subject token's "scope" claim. A subject token without a "scope" claim
+    yields a zero-scope delegated token — correct and fail-closed, but easy
+    to mistake for a bug on first use. Microsoft Entra v2 access tokens
+    carry scopes under "scp", not "scope" — this claim handling does not
+    read "scp", so an Entra subject token hits the same zero-scope case
+    even though it does carry scopes.
+ 3. Subject namespace: a trusted issuer is trusted to assert ANY subject
+    this server accepts for delegation — the delegated token carries this
+    server's own "iss" with the external token's "sub" copied verbatim and
+    no first-class marker of provenance. Each trusted issuer's subject
+    namespace (and scope names) MUST be disjoint from every upstream
+    provider's and from every other trusted issuer's, or it can mint a
+    delegated token indistinguishable from a real user's.
+
+
+
+_Appears in:_
+- [api.v1beta1.EmbeddedAuthServerConfig](#apiv1beta1embeddedauthserverconfig)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `issuerUrl` _string_ | IssuerURL is the expected "iss" claim value (exact match) for subject<br />tokens from this issuer. Must be an HTTPS URL — unlike upstream<br />providers and this server's own issuer, there is no insecureAllowHTTP<br />escape hatch for a trusted issuer configured via this CRD (see the<br />type doc). No query, fragment, or trailing slash (per RFC 8414),<br />matching the same shape required of this server's own issuer. |  | MaxLength: 2048 <br />Pattern: `^https://[^\s?#]+[^/\s?#]$` <br />Required: \{\} <br /> |
+| `expectedAudience` _string_ | ExpectedAudience is the expected "aud" claim value that must appear in<br />the subject token's audience list. Set it to the same value as this<br />resource's own resourceUrl (MCPServer/MCPRemoteProxy's oidcConfigRef,<br />or VirtualMCPServer's incomingAuth OIDC "resource") — see the Audience<br />constraint in the type doc — and configure the external IdP's<br />Application ID URI (or equivalent API identifier) to that same value. |  | MaxLength: 2048 <br />MinLength: 1 <br />Required: \{\} <br /> |
+| `jwksUrl` _string_ | JWKSURL is the URL to fetch the issuer's JSON Web Key Set from. If<br />empty, it is resolved via OIDC discovery at<br />\{issuerUrl\}/.well-known/openid-configuration. Unlike issuerUrl, this is<br />an ordinary endpoint URL rather than an issuer identifier, so — unlike<br />issuerUrl's pattern — it may carry a query string: real-world jwks_uri<br />values legitimately do, e.g. Azure AD B2C's includes "?p=B2C_1_...".<br />HTTPS is still required; there is no insecureAllowHTTP escape hatch<br />here either. Required when allowPrivateIPs is true (see below). |  | MaxLength: 2048 <br />Pattern: `^https://[^\s#]+$` <br />Optional: \{\} <br /> |
+| `allowPrivateIPs` _boolean_ | AllowPrivateIPs permits OIDC discovery and JWKS fetches for this<br />issuer to resolve to a private or loopback address — e.g. an<br />in-cluster IdP addressed by ClusterIP-range DNS, or an IdP reachable<br />only via a private endpoint. HTTPS is still mandatory, so the fetch<br />remains certificate-authenticated regardless of the peer's address;<br />the residual exposure is a blind, bounded SSRF (HTTPS-only GET,<br />same-host redirects only, a size-capped response that is never echoed<br />back to the caller, and the response must parse as a JWKS to matter at<br />all). Requires jwksUrl to be set, so the private target is pinned to<br />operator config rather than an attacker-suppliable discovery document.<br />Defaults to false. |  | Optional: \{\} <br /> |
+| `actorClaim` _string_ | ActorClaim names the claim that identifies the client that requested<br />the subject token from this issuer, used for the allowedActors consent<br />check below. Values are in the external issuer's own client namespace —<br />they are NOT ToolHive client IDs. Defaults to "azp" when empty. Set to<br />"appid" for Microsoft Entra v1 tokens, or "cid" for Okta tokens. The<br />special value "client_id" reads the token's client_id claim from a<br />structured field instead of the general claim bag.<br />Deliberately not enum-constrained: acceptable claim names vary by<br />provider and this list is not exhaustive. Rejected instead by a denylist<br />CEL rule: "sub", "iss", "aud", "exp", "iat", "nbf", "jti", "name",<br />"email", "scope", and "may_act" are routed to structured fields and<br />never reach the general claim bag this check reads from, so<br />configuring one of them here would silently reject every token from<br />the issuer. |  | MaxLength: 128 <br />Optional: \{\} <br /> |
+| `allowedActors` _string array_ | AllowedActors is the allowlist of actorClaim values authorized to<br />exchange a subject token from this issuer, when the token does not<br />carry a "may_act" claim.<br />Fail-closed: empty (the default) means only may_act-bearing tokens from<br />this issuer are accepted — every other token from it is rejected. |  | MaxItems: 50 <br />items:MaxLength: 256 <br />items:MinLength: 1 <br />Optional: \{\} <br /> |
 
 
 #### api.v1beta1.UpstreamInjectSpec

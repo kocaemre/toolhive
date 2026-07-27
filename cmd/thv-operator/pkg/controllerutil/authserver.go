@@ -17,6 +17,7 @@ import (
 	"github.com/stacklok/toolhive/cmd/thv-operator/pkg/oidc"
 	"github.com/stacklok/toolhive/pkg/authserver"
 	authrunner "github.com/stacklok/toolhive/pkg/authserver/runner"
+	"github.com/stacklok/toolhive/pkg/authserver/server/tokenexchange"
 	"github.com/stacklok/toolhive/pkg/authserver/storage"
 	"github.com/stacklok/toolhive/pkg/runner"
 )
@@ -599,7 +600,37 @@ func BuildAuthServerRunConfig(
 		}
 	}
 
+	// Map trusted external OIDC issuers accepted as RFC 8693 subject tokens.
+	// InsecureAllowHTTP has no CRD field (see TrustedIssuerConfig's doc
+	// comment) and is left false — the intended production posture for the
+	// operator-managed path. AllowPrivateIPs does have a CRD field and is
+	// mapped through below.
+	config.TrustedIssuers = buildTrustedIssuersRunConfig(authConfig.TrustedIssuers)
+
 	return config, nil
+}
+
+// buildTrustedIssuersRunConfig converts CRD TrustedIssuerConfig entries to
+// tokenexchange.TrustedIssuer, the wire type reused verbatim by
+// authserver.RunConfig.TrustedIssuers. Returns nil when trustedIssuers is
+// empty, so an MCPExternalAuthConfig that omits trustedIssuers produces a
+// RunConfig identical to one from before this field existed.
+func buildTrustedIssuersRunConfig(trustedIssuers []mcpv1beta1.TrustedIssuerConfig) []tokenexchange.TrustedIssuer {
+	if len(trustedIssuers) == 0 {
+		return nil
+	}
+	out := make([]tokenexchange.TrustedIssuer, len(trustedIssuers))
+	for i, ti := range trustedIssuers {
+		out[i] = tokenexchange.TrustedIssuer{
+			IssuerURL:        ti.IssuerURL,
+			ExpectedAudience: ti.ExpectedAudience,
+			JWKSURL:          ti.JWKSURL,
+			AllowPrivateIPs:  ti.AllowPrivateIPs,
+			ActorClaim:       ti.ActorClaim,
+			AllowedActors:    ti.AllowedActors,
+		}
+	}
+	return out
 }
 
 // buildStorageRunConfig converts CRD AuthServerStorageConfig to storage.RunConfig.
