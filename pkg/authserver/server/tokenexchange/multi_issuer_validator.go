@@ -20,12 +20,21 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 
+	"github.com/stacklok/toolhive/pkg/networking"
 	"github.com/stacklok/toolhive/pkg/oauthproto"
 )
 
 const (
 	// jwksCacheTTL is the time-to-live for cached JWKS fetched from external issuers.
 	jwksCacheTTL = 5 * time.Minute
+
+	// jwksFailureBackoff bounds how often a failed JWKS fetch is retried for
+	// the same issuer. resolveJWKS runs before the subject token's signature
+	// is checked, so without this an authenticated client holding the
+	// token-exchange grant could repeatedly abort the connection mid-fetch
+	// and force a fresh discovery+JWKS round trip to the external IdP on
+	// every attempt.
+	jwksFailureBackoff = 30 * time.Second
 
 	// httpTimeout is the timeout for HTTP requests to external OIDC endpoints.
 	httpTimeout = 10 * time.Second
@@ -38,9 +47,6 @@ const (
 	// maxJWKSKeys caps the number of keys accepted from an external JWKS to
 	// prevent CPU amplification from a hostile endpoint serving many keys.
 	maxJWKSKeys = 100
-
-	// maxRedirects caps redirects followed when fetching external OIDC metadata.
-	maxRedirects = 5
 
 	// defaultActorClaim is the claim read to identify the client that
 	// requested an external subject token, when a TrustedIssuer does not
@@ -88,6 +94,20 @@ type TrustedIssuer struct {
 	// JWKSURL is the URL to fetch the issuer's JSON Web Key Set from.
 	// If empty, it is resolved via OIDC discovery at {IssuerURL}/.well-known/openid-configuration.
 	JWKSURL string `json:"jwks_url,omitempty" yaml:"jwks_url,omitempty"`
+	// InsecureAllowHTTP permits plain-HTTP OIDC discovery and JWKS fetches
+	// for THIS issuer only. Development and testing only — never set in
+	// production. Does not relax the private-IP guard; see AllowPrivateIPs
+	// for that. Deliberately per-issuer rather than a validator-wide or
+	// self-issuer setting: this authorization server's own InsecureAllowHTTP
+	// (e.g. for an in-cluster issuer) must not silently permit plaintext
+	// discovery for every trusted external issuer too — a network attacker
+	// who can intercept that traffic could substitute a JWKS and thereafter
+	// forge subject tokens for that issuer's namespace.
+	InsecureAllowHTTP bool `json:"insecure_allow_http,omitempty" yaml:"insecure_allow_http,omitempty"`
+	// AllowPrivateIPs permits OIDC discovery and JWKS fetches for THIS
+	// issuer to resolve to a private or loopback address. Use only when the
+	// issuer is hosted inside the same cluster and has no public endpoint.
+	AllowPrivateIPs bool `json:"allow_private_ips,omitempty" yaml:"allow_private_ips,omitempty"`
 	// ActorClaim names the claim that identifies the client that requested the
 	// subject token from THIS EXTERNAL ISSUER, used for the AllowedActors consent
 	// check below. Values are in the external issuer's client namespace — they are
@@ -142,36 +162,46 @@ type MultiIssuerTokenValidator struct {
 	selfIssuer    string
 	selfValidator *SelfIssuedTokenValidator
 	issuers       map[string]*externalIssuerConfig
-	httpClient    *http.Client
-
-	// insecureSkipJWKSURLValidation disables HTTPS enforcement on discovered
-	// JWKS URLs and relaxes the dial-time IP/scheme checks (so httptest servers
-	// on loopback over HTTP are reachable). This MUST only be set for testing
-	// with httptest servers.
-	insecureSkipJWKSURLValidation bool
 }
 
 // externalIssuerConfig holds the configuration and cached state for an external
 // OIDC issuer. The embedded TrustedIssuer is treated as immutable after
-// construction: resolveAllowedActor reads TrustedIssuer.AllowedActors on every
-// validation without holding mu, since mu protects JWKS state only. Mutating
-// TrustedIssuer fields in place after NewMultiIssuerTokenValidator returns is a
-// data race.
+// construction: resolveAllowedActor reads TrustedIssuer.AllowedActors (and
+// discoverJWKSURL/fetchJWKS read httpClient) on every validation without
+// holding mu, since mu protects JWKS state only. Mutating TrustedIssuer
+// fields in place after NewMultiIssuerTokenValidator returns is a data race.
 type externalIssuerConfig struct {
 	TrustedIssuer
 
+	// httpClient is dedicated to this issuer, built once at construction
+	// time from its own InsecureAllowHTTP/AllowPrivateIPs. A single
+	// validator-wide client couldn't enforce per-issuer SSRF/transport
+	// policy: http.Client.CheckRedirect and Transport.DialContext have no
+	// way to know which issuer's fetch they are guarding.
+	httpClient *http.Client
+
 	mu      sync.Mutex
 	jwksURL string              // resolved from OIDC discovery or preconfigured
-	jwks    *jose.JSONWebKeySet // cached JWKS
-	jwksExp time.Time           // when the cached JWKS expires
+	jwks    *jose.JSONWebKeySet // cached JWKS from the last successful fetch
+	jwksErr error               // non-nil while jwksExp holds a failure-backoff deadline instead of a success expiry (see jwksFailureBackoff)
+	jwksExp time.Time           // success cache expiry, or failure-backoff deadline when jwksErr != nil
 }
 
 // NewMultiIssuerTokenValidator creates a validator that accepts tokens from the
 // authorization server itself and from the provided list of trusted external issuers.
-// Returns an error if selfValidator is nil, selfIssuer is empty, or any TrustedIssuer
-// is invalid: empty IssuerURL or ExpectedAudience, an IssuerURL equal to selfIssuer
+// Returns an error if selfValidator is nil, selfIssuer is empty, any TrustedIssuer
+// is invalid (empty IssuerURL or ExpectedAudience, an IssuerURL equal to selfIssuer
 // or duplicated across entries, or an ActorClaim naming a claim assignClaim never
-// leaves in Extra (see actorClaimsNotInExtra).
+// leaves in Extra — see actorClaimsNotInExtra), or an issuer's dedicated HTTP
+// client cannot be built.
+//
+// Each issuer gets its own *http.Client, built by
+// networking.NewHttpClientBuilder from that issuer's own
+// InsecureAllowHTTP/AllowPrivateIPs — never from a validator-wide flag,
+// from this authorization server's own equivalent settings, or from any
+// environment-variable bypass (see the comment where the client is built).
+// See the doc comment on TrustedIssuer.InsecureAllowHTTP for why the
+// per-issuer separation matters.
 func NewMultiIssuerTokenValidator(
 	selfValidator *SelfIssuedTokenValidator,
 	selfIssuer string,
@@ -203,53 +233,82 @@ func NewMultiIssuerTokenValidator(
 		// state only).
 		ti.AllowedActors = slices.Clone(ti.AllowedActors)
 
+		// Deliberately networking.NewHttpClientBuilder(), not
+		// NewHostScopedClientBuilder: that helper ORs
+		// INSECURE_DISABLE_URL_VALIDATION and an auto-localhost exemption
+		// into BOTH the HTTP-scheme and private-IP gates, so an unrelated
+		// env var — or a trusted issuer that merely happens to be on
+		// localhost — would silently widen AllowPrivateIPs regardless of
+		// what the operator set. That defeats the point of splitting the
+		// two flags per issuer. Passing InsecureAllowHTTP/AllowPrivateIPs
+		// straight through keeps both gates independent and, for the
+		// private-IP gate, env-independent (Build only installs the
+		// dial-time private-IP guard when AllowPrivateIPs is false; that
+		// guard itself never reads the environment).
+		//
+		// One residual: the built client's ValidatingTransport still skips
+		// its HTTPS-scheme check when INSECURE_DISABLE_URL_VALIDATION is
+		// set — that env read is baked into every builder-made client in
+		// this repo. It is backstopped here: validateJWKSURL, called from
+		// resolveJWKS before every fetch, enforces the scheme independently
+		// of any environment variable, so it must stay there rather than
+		// being treated as redundant with this client's own check.
+		//
+		// Unlike the sibling newHTTPClientForHost (upstream/oauth2.go),
+		// keep-alives are disabled: that client dials one operator-configured
+		// host repeatedly on a hot path, so it deliberately keeps them on.
+		// This one dials jwks_uri — a host taken from an untrusted discovery
+		// document — at most twice per jwksCacheTTL window, so it's the
+		// "caller-varying host" case that comment's own doc says to revisit
+		// for; there's no hot path here to trade the per-dial SSRF check away
+		// for.
+		httpClient, err := networking.NewHttpClientBuilder().
+			WithInsecureAllowHTTP(ti.InsecureAllowHTTP).
+			WithPrivateIPs(ti.AllowPrivateIPs).
+			WithTimeout(httpTimeout).
+			WithDisableKeepAlives(true).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("issuer_url %q: failed to build HTTP client: %w", ti.IssuerURL, err)
+		}
+		// Guard against a discovery/JWKS redirect hop landing on a
+		// different, unvetted host — the same policy the transparent proxy
+		// data path applies to a response derived from an untrusted remote
+		// server (see SameHostRedirectPolicy's doc comment).
+		httpClient.CheckRedirect = networking.SameHostRedirectPolicy()
+
 		issuers[ti.IssuerURL] = &externalIssuerConfig{
 			TrustedIssuer: ti,
 			jwksURL:       ti.JWKSURL,
+			httpClient:    httpClient,
 		}
 	}
 
-	v := &MultiIssuerTokenValidator{
+	return &MultiIssuerTokenValidator{
 		selfIssuer:    selfIssuer,
 		selfValidator: selfValidator,
 		issuers:       issuers,
-	}
+	}, nil
+}
 
-	v.httpClient = &http.Client{
-		Timeout: httpTimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= maxRedirects {
-				return errors.New("too many redirects")
-			}
-			// Re-validate the scheme of each redirect hop; the resolved IP
-			// is checked in DialContext below.
-			if !v.insecureSkipJWKSURLValidation && req.URL.Scheme != "https" {
-				return fmt.Errorf("redirect to non-HTTPS URL: %q", req.URL.Scheme)
-			}
-			return nil
-		},
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				host, port, err := net.SplitHostPort(addr)
-				if err != nil {
-					return nil, err
-				}
-				ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-				if err != nil {
-					return nil, err
-				}
-				for _, ipa := range ips {
-					if !v.insecureSkipJWKSURLValidation && isDisallowedIP(ipa.IP) {
-						return nil, fmt.Errorf("refusing to connect to disallowed address %s", ipa.IP)
-					}
-				}
-				return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(
-					ctx, network, net.JoinHostPort(ips[0].String(), port))
-			},
-		},
+// ValidateTrustedIssuers runs every structural check
+// NewMultiIssuerTokenValidator performs on trustedIssuers — required fields,
+// self-issuer collision, duplicate issuers, and ActorClaim reachability —
+// without constructing a validator or any per-issuer HTTP client. Config
+// validation calls this to fail before the live upstream DCR registration
+// and storage creation that run between RunConfig.Validate and server
+// construction; NewMultiIssuerTokenValidator repeats the same checks at
+// server startup as defence in depth. Both route through validateTrustedIssuer,
+// so the two can't drift out of sync.
+func ValidateTrustedIssuers(trustedIssuers []TrustedIssuer, selfIssuer string) error {
+	issuers := make(map[string]*externalIssuerConfig, len(trustedIssuers))
+	for _, ti := range trustedIssuers {
+		if err := validateTrustedIssuer(ti, selfIssuer, issuers); err != nil {
+			return err
+		}
+		issuers[ti.IssuerURL] = &externalIssuerConfig{TrustedIssuer: ti}
 	}
-
-	return v, nil
+	return nil
 }
 
 // Validate parses the raw JWT to extract the issuer claim, then routes validation
@@ -366,7 +425,16 @@ func (v *MultiIssuerTokenValidator) validateExternalToken(
 
 // resolveJWKS returns the cached JWKS for an external issuer, fetching it if
 // the cache is empty or expired. If the JWKS URL is not configured, it is first
-// resolved via OIDC discovery.
+// resolved via OIDC discovery. Before every fetch, the resolved URL (whether
+// hand-configured or just discovered) is checked by validateJWKSURL against
+// this issuer's own InsecureAllowHTTP/AllowPrivateIPs — the single point both
+// paths pass through, so neither can bypass the HTTPS/SSRF guard.
+//
+// A failed fetch is cached too, for jwksFailureBackoff (see jwksErr): the
+// caller (validateExternalToken) runs this before verifying the subject
+// token's signature, so without backoff a client presenting a syntactically
+// valid but unverifiable JWT naming this issuer could force a fresh
+// discovery+fetch round trip on every attempt.
 func (v *MultiIssuerTokenValidator) resolveJWKS(
 	ctx context.Context,
 	issuerConfig *externalIssuerConfig,
@@ -376,37 +444,73 @@ func (v *MultiIssuerTokenValidator) resolveJWKS(
 	// The lock is intentionally held across the network fetch so concurrent
 	// validations of the same issuer don't trigger duplicate JWKS fetches.
 
-	// Return cached JWKS if still valid.
-	if issuerConfig.jwks != nil && time.Now().Before(issuerConfig.jwksExp) {
+	now := time.Now()
+	if now.Before(issuerConfig.jwksExp) {
+		if issuerConfig.jwksErr != nil {
+			return nil, issuerConfig.jwksErr
+		}
 		return issuerConfig.jwks, nil
 	}
 
-	// Cache expired — clear the discovered URL so we re-discover on next fetch.
-	// This handles the (rare) case where an issuer rotates its JWKS endpoint URL.
-	// The explicitly configured JWKSURL (from TrustedIssuer) is preserved.
+	// Detach from the caller's request context: net/http cancels ctx when
+	// the client disconnects, and this fetch happens before the subject
+	// token's signature is even checked, so an aborted connection must not
+	// cut off a fetch other in-flight validations of this issuer are
+	// waiting on (the lock above), nor let repeating the abort drive
+	// unbounded outbound requests to the external IdP.
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*httpTimeout)
+	defer cancel()
+
+	jwks, err := v.fetchAndValidateJWKS(fetchCtx, issuerConfig)
+	if err != nil {
+		issuerConfig.jwksErr = err
+		issuerConfig.jwksExp = now.Add(jwksFailureBackoff)
+		return nil, err
+	}
+
+	issuerConfig.jwks = jwks
+	issuerConfig.jwksErr = nil
+	issuerConfig.jwksExp = now.Add(jwksCacheTTL)
+	return jwks, nil
+}
+
+// fetchAndValidateJWKS resolves issuerConfig.jwksURL — discovering it via
+// OIDC first if not yet known — validates it, and fetches the JWKS it points
+// to. Split out of resolveJWKS so the cache/backoff bookkeeping there has a
+// single success/failure exit point to react to.
+//
+// Callers must hold issuerConfig.mu: this reads and writes issuerConfig.jwksURL.
+func (v *MultiIssuerTokenValidator) fetchAndValidateJWKS(
+	ctx context.Context,
+	issuerConfig *externalIssuerConfig,
+) (*jose.JSONWebKeySet, error) {
+	// Cache expired — clear the discovered URL so we re-discover on next
+	// fetch. This handles the (rare) case where an issuer rotates its JWKS
+	// endpoint URL. The explicitly configured JWKSURL (from TrustedIssuer)
+	// is preserved.
 	if issuerConfig.JWKSURL == "" {
 		issuerConfig.jwksURL = ""
 	}
 
 	// Discover the JWKS URL if not yet resolved.
 	if issuerConfig.jwksURL == "" {
-		jwksURL, err := v.discoverJWKSURL(ctx, issuerConfig.IssuerURL)
+		jwksURL, err := v.discoverJWKSURL(ctx, issuerConfig)
 		if err != nil {
 			return nil, fmt.Errorf("OIDC discovery failed for %s: %w", issuerConfig.IssuerURL, err)
 		}
 		issuerConfig.jwksURL = jwksURL
 	}
 
-	// Fetch and cache the JWKS.
-	jwks, err := v.fetchJWKS(ctx, issuerConfig.jwksURL)
-	if err != nil {
-		return nil, err
+	// Validate the JWKS URL here, in the single choke point every fetch
+	// passes through — whether it was hand-configured on TrustedIssuer or
+	// just discovered above. A configured JWKSURL never reaches
+	// discoverJWKSURL, so checking only there would leave hand-configured
+	// URLs unvalidated.
+	if err := validateJWKSURL(issuerConfig.jwksURL, issuerConfig.InsecureAllowHTTP, issuerConfig.AllowPrivateIPs); err != nil {
+		return nil, fmt.Errorf("jwks_url for issuer %s is invalid: %w", issuerConfig.IssuerURL, err)
 	}
 
-	issuerConfig.jwks = jwks
-	issuerConfig.jwksExp = time.Now().Add(jwksCacheTTL)
-
-	return jwks, nil
+	return v.fetchJWKS(ctx, issuerConfig)
 }
 
 // peekIssuer parses a JWT without signature verification to extract the "iss" claim.
@@ -430,16 +534,16 @@ func peekIssuer(rawToken string) (string, error) {
 
 // discoverJWKSURL performs OIDC discovery to resolve the JWKS URL for an issuer.
 // It fetches the OpenID Connect discovery document at {issuerURL}/.well-known/openid-configuration
-// and extracts the jwks_uri field.
-func (v *MultiIssuerTokenValidator) discoverJWKSURL(ctx context.Context, issuerURL string) (string, error) {
-	discoveryURL := issuerURL + "/.well-known/openid-configuration"
+// and extracts the jwks_uri field, using issuerConfig's own dedicated HTTP client.
+func (*MultiIssuerTokenValidator) discoverJWKSURL(ctx context.Context, issuerConfig *externalIssuerConfig) (string, error) {
+	discoveryURL := issuerConfig.IssuerURL + "/.well-known/openid-configuration"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, discoveryURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create discovery request: %w", err)
 	}
 
-	resp, err := v.httpClient.Do(req)
+	resp, err := issuerConfig.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("discovery request failed: %w", err)
 	}
@@ -460,59 +564,55 @@ func (v *MultiIssuerTokenValidator) discoverJWKSURL(ctx context.Context, issuerU
 		return "", fmt.Errorf("failed to parse discovery document: %w", err)
 	}
 
-	if doc.Issuer != issuerURL {
-		return "", fmt.Errorf("discovery document issuer %q does not match expected issuer %q", doc.Issuer, issuerURL)
+	if doc.Issuer != issuerConfig.IssuerURL {
+		return "", fmt.Errorf("discovery document issuer %q does not match expected issuer %q", doc.Issuer, issuerConfig.IssuerURL)
 	}
 
 	if doc.JWKSURI == "" {
 		return "", fmt.Errorf("discovery document missing 'jwks_uri'")
 	}
 
-	if !v.insecureSkipJWKSURLValidation {
-		if err := validateJWKSURL(doc.JWKSURI); err != nil {
-			return "", fmt.Errorf("discovered jwks_uri is invalid: %w", err)
-		}
-	}
-
+	// The returned URL is validated by the caller (resolveJWKS), which is
+	// the single choke point covering both discovered and pre-configured
+	// JWKS URLs.
 	return doc.JWKSURI, nil
 }
 
-// validateJWKSURL checks that the JWKS URL uses HTTPS and is not a private/loopback address.
-// This prevents SSRF attacks where a compromised discovery document points to internal services.
-func validateJWKSURL(jwksURL string) error {
+// validateJWKSURL checks that jwksURL uses HTTPS, unless insecureAllowHTTP
+// permits plain HTTP, and is not a private/loopback address literal, unless
+// allowPrivateIPs permits that. Both flags come from the specific
+// TrustedIssuer being fetched (see resolveJWKS), never from a validator-wide
+// or self-issuer setting. This prevents SSRF attacks where a compromised
+// discovery document — or a hand-configured jwks_url — points to internal
+// services.
+func validateJWKSURL(jwksURL string, insecureAllowHTTP, allowPrivateIPs bool) error {
 	u, err := url.Parse(jwksURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
 	}
 
-	if u.Scheme != "https" {
+	if u.Scheme != "https" && !insecureAllowHTTP {
 		return fmt.Errorf("must use HTTPS, got %q", u.Scheme)
 	}
 
 	host := u.Hostname()
 	ip := net.ParseIP(host)
-	if ip != nil && isDisallowedIP(ip) {
+	if ip != nil && !allowPrivateIPs && networking.IsPrivateIP(ip) {
 		return errors.New("must not point to a private or loopback address")
 	}
 
 	return nil
 }
 
-// isDisallowedIP reports whether an IP must not be dialed when fetching
-// external OIDC metadata, blocking SSRF to internal/metadata addresses.
-func isDisallowedIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
-}
-
-// fetchJWKS fetches a JSON Web Key Set from the given URL.
-func (v *MultiIssuerTokenValidator) fetchJWKS(ctx context.Context, jwksURL string) (*jose.JSONWebKeySet, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwksURL, nil)
+// fetchJWKS fetches a JSON Web Key Set from issuerConfig.jwksURL using its
+// dedicated HTTP client.
+func (*MultiIssuerTokenValidator) fetchJWKS(ctx context.Context, issuerConfig *externalIssuerConfig) (*jose.JSONWebKeySet, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, issuerConfig.jwksURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create JWKS request: %w", err)
 	}
 
-	resp, err := v.httpClient.Do(req)
+	resp, err := issuerConfig.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("JWKS request failed: %w", err)
 	}
@@ -547,23 +647,29 @@ func (v *MultiIssuerTokenValidator) fetchJWKS(ctx context.Context, jwksURL strin
 // before it is admitted into issuers: required fields, no collision with
 // selfIssuer or an already-registered issuer, and an ActorClaim that
 // resolveAllowedActor can actually read from Extra (or ClientID).
+//
+// Error messages name TrustedIssuer's wire keys (issuer_url,
+// expected_audience, actor_claim), not its Go field names: TrustedIssuer is
+// the serialized RunConfig.TrustedIssuers schema (see its doc comment), so an
+// operator's YAML uses these keys and should see them echoed back, not Go
+// identifiers they never wrote.
 func validateTrustedIssuer(ti TrustedIssuer, selfIssuer string, issuers map[string]*externalIssuerConfig) error {
 	if ti.IssuerURL == "" {
-		return errors.New("trusted issuer: IssuerURL is required")
+		return errors.New("issuer_url is required")
 	}
 	if ti.ExpectedAudience == "" {
-		return fmt.Errorf("trusted issuer %q: ExpectedAudience is required", ti.IssuerURL)
+		return fmt.Errorf("issuer_url %q: expected_audience is required", ti.IssuerURL)
 	}
 	if ti.IssuerURL == selfIssuer {
-		return fmt.Errorf("trusted issuer %q: must not equal selfIssuer; "+
+		return fmt.Errorf("issuer_url %q: must not equal the authorization server's own issuer; "+
 			"self-issued tokens are already handled separately", ti.IssuerURL)
 	}
 	if _, dup := issuers[ti.IssuerURL]; dup {
-		return fmt.Errorf("trusted issuer %q: configured more than once", ti.IssuerURL)
+		return fmt.Errorf("issuer_url %q: configured more than once", ti.IssuerURL)
 	}
 	if ti.ActorClaim != "" && slices.Contains(actorClaimsNotInExtra, ti.ActorClaim) {
 		return fmt.Errorf(
-			"trusted issuer %q: ActorClaim %q is not supported "+
+			"issuer_url %q: actor_claim %q is not supported "+
 				`(use "client_id" or a non-registered claim such as "azp", "appid", "cid")`,
 			ti.IssuerURL, ti.ActorClaim)
 	}

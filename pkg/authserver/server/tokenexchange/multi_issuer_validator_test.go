@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -82,9 +81,18 @@ func newMultiValidator(
 	selfValidator, err := NewSelfIssuedTokenValidator(selfJWKS.publicJWKS(), testIssuer, []string{testIssuer})
 	require.NoError(t, err)
 
-	v, err := NewMultiIssuerTokenValidator(selfValidator, testIssuer, trustedIssuers)
+	// Copy rather than mutate the caller's slice: give every test issuer
+	// permissive flags so its httptest discovery/JWKS server, which runs on
+	// loopback over plain HTTP, is reachable.
+	issuers := make([]TrustedIssuer, len(trustedIssuers))
+	for i, ti := range trustedIssuers {
+		ti.InsecureAllowHTTP = true
+		ti.AllowPrivateIPs = true
+		issuers[i] = ti
+	}
+
+	v, err := NewMultiIssuerTokenValidator(selfValidator, testIssuer, issuers)
 	require.NoError(t, err)
-	v.insecureSkipJWKSURLValidation = true // Allow HTTP test servers
 	return v
 }
 
@@ -783,7 +791,7 @@ func TestNewMultiIssuerTokenValidator_Validation(t *testing.T) {
 				IssuerURL:        "",
 				ExpectedAudience: testExternalAudience,
 			}},
-			errContains: "IssuerURL is required",
+			errContains: "issuer_url is required",
 		},
 		{
 			name:          "empty ExpectedAudience rejected",
@@ -793,7 +801,7 @@ func TestNewMultiIssuerTokenValidator_Validation(t *testing.T) {
 				IssuerURL:        testExternalIssuer,
 				ExpectedAudience: "",
 			}},
-			errContains: "ExpectedAudience is required",
+			errContains: "expected_audience is required",
 		},
 		{
 			name:          "IssuerURL equal to selfIssuer rejected",
@@ -803,7 +811,7 @@ func TestNewMultiIssuerTokenValidator_Validation(t *testing.T) {
 				IssuerURL:        testIssuer,
 				ExpectedAudience: testExternalAudience,
 			}},
-			errContains: "must not equal selfIssuer",
+			errContains: "must not equal the authorization server's own issuer",
 		},
 		{
 			name:          "duplicate IssuerURL rejected",
@@ -824,7 +832,7 @@ func TestNewMultiIssuerTokenValidator_Validation(t *testing.T) {
 				ExpectedAudience: testExternalAudience,
 				ActorClaim:       "sub",
 			}},
-			errContains: "ActorClaim",
+			errContains: "actor_claim",
 		},
 		{
 			name:          `ActorClaim "scope" rejected — rerouted to a structured field`,
@@ -835,7 +843,7 @@ func TestNewMultiIssuerTokenValidator_Validation(t *testing.T) {
 				ExpectedAudience: testExternalAudience,
 				ActorClaim:       "scope",
 			}},
-			errContains: "ActorClaim",
+			errContains: "actor_claim",
 		},
 		{
 			name:          `ActorClaim "may_act" rejected — rerouted to a structured field`,
@@ -846,7 +854,7 @@ func TestNewMultiIssuerTokenValidator_Validation(t *testing.T) {
 				ExpectedAudience: testExternalAudience,
 				ActorClaim:       "may_act",
 			}},
-			errContains: "ActorClaim",
+			errContains: "actor_claim",
 		},
 	}
 
@@ -1088,10 +1096,15 @@ func TestMultiIssuerTokenValidator_KidMismatch(t *testing.T) {
 }
 
 // TestValidateJWKSURL exercises validateJWKSURL directly: this is the SSRF
-// guard applied to a discovered jwks_uri (discoverJWKSURL). The equivalent
-// checks on a *configured* JWKSURL and on redirect hops are exercised
-// end-to-end elsewhere (insecureSkipJWKSURLValidation disables them for
-// httptest servers, so they can't run through Validate in these tests).
+// guard applied in resolveJWKS to every JWKS URL for a given issuer, whether
+// hand-configured on TrustedIssuer or resolved via discovery. The equivalent
+// check on redirect hops (networking.SameHostRedirectPolicy) and the
+// dial-time IP guard (networking.NewHostScopedClientBuilder) are exercised
+// via the networking package's own tests, not here. These cases all pass
+// insecureAllowHTTP=false, allowPrivateIPs=false — the strict defaults —
+// since every other test in this file goes through newMultiValidator, which
+// sets both permissive flags on its test issuers to reach their httptest
+// servers over plain HTTP on loopback.
 func TestValidateJWKSURL(t *testing.T) {
 	t.Parallel()
 
@@ -1111,44 +1124,13 @@ func TestValidateJWKSURL(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := validateJWKSURL(tt.url)
+			err := validateJWKSURL(tt.url, false, false)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 				return
 			}
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
-		})
-	}
-}
-
-// TestIsDisallowedIP exercises isDisallowedIP directly: the dial-time SSRF
-// guard applied to every resolved IP address before fetching JWKS/discovery
-// documents.
-func TestIsDisallowedIP(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		ip   string
-		want bool
-	}{
-		{name: "IPv4 loopback disallowed", ip: "127.0.0.1", want: true},
-		{name: "IPv6 loopback disallowed", ip: "::1", want: true},
-		{name: "private 10.0.0.0/8 disallowed", ip: "10.1.2.3", want: true},
-		{name: "private 192.168.0.0/16 disallowed", ip: "192.168.1.1", want: true},
-		{name: "link-local unicast disallowed", ip: "169.254.1.1", want: true},
-		{name: "unspecified address disallowed", ip: "0.0.0.0", want: true},
-		{name: "public address allowed", ip: "8.8.8.8", want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			ip := net.ParseIP(tt.ip)
-			require.NotNil(t, ip, "test IP must parse")
-			assert.Equal(t, tt.want, isDisallowedIP(ip))
 		})
 	}
 }
@@ -1221,7 +1203,7 @@ func TestMultiIssuerTokenValidator_FetchJWKS(t *testing.T) {
 			}}
 			validator := newMultiValidator(t, selfJWKS, trustedIssuers)
 
-			_, err := validator.fetchJWKS(context.Background(), srv.URL+"/jwks")
+			_, err := validator.fetchJWKS(context.Background(), validator.issuers[testExternalIssuer])
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
 		})

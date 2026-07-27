@@ -55,7 +55,7 @@ func TestFactory(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			f, err := Factory(tt.delegationLifespan)
+			f, err := Factory(tt.delegationLifespan, nil)
 			if tt.wantErr {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), "delegationLifespan must be between")

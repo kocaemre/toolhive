@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"regexp"
 	"slices"
@@ -127,7 +128,7 @@ type RunConfig struct {
 	// Fail-closed consent per issuer: an empty AllowedActors accepts only
 	// subject tokens carrying a "may_act" claim; every other token from that
 	// issuer is rejected. See tokenexchange.TrustedIssuer for the full field
-	// reference, and the two operator-facing constraints below that are not
+	// reference, and the operator-facing constraints below that are not
 	// visible from the config shape alone:
 	//
 	//  1. Audience: the token-exchange handler bounds the requested audience
@@ -141,7 +142,23 @@ type RunConfig struct {
 	//  2. Scopes: the handler intersects the client's registered scopes with
 	//     the subject token's "scope" claim. A subject token with no "scope"
 	//     claim grants a zero-scope delegated token — correct and fail-closed,
-	//     but easy to mistake for a bug on first use.
+	//     but easy to mistake for a bug on first use. Microsoft Entra v2
+	//     access tokens carry scopes under "scp", not "scope" — the JWT
+	//     claim handling is unchanged by this document, so an Entra subject
+	//     token hits this same zero-scope case even when it does carry
+	//     scopes. Worth expecting up front, since Entra is also the provider
+	//     tokenexchange.TrustedIssuer's ActorClaim default ("azp") targets.
+	//  3. Subject namespace: a trusted issuer is trusted to assert ANY
+	//     subject this server will accept for delegation — the delegated
+	//     token carries ToolHive's own "iss" with the external token's "sub"
+	//     copied verbatim and no first-class marker of provenance, and
+	//     downstream authorizers key on "sub" alone. Each trusted issuer's
+	//     subject namespace (and, for the same reason, its scope names) MUST
+	//     be disjoint from every upstream IdP's and from every other trusted
+	//     issuer's. Example: if an upstream's SubjectClaim/SubjectPath
+	//     resolves to an email address and a trusted issuer's "sub" is also
+	//     an email address, that issuer can mint a delegated token
+	//     indistinguishable from a real ToolHive-native user's.
 	//nolint:lll // field tags require full JSON+YAML names
 	TrustedIssuers []tokenexchange.TrustedIssuer `json:"trusted_issuers,omitempty" yaml:"trusted_issuers,omitempty"`
 }
@@ -159,10 +176,11 @@ func (c *RunConfig) Validate() error {
 	// Also checked by Config.Validate() (same reasoning as
 	// validateBaselineClientScopes below): buildUpstreamConfigs performs live
 	// RFC 7591 registration against upstream IdPs before authserver.New ever
-	// reaches Config.Validate(), so a malformed trusted-issuer URL must fail
-	// here, before that side-effecting work runs — not on a crash loop after
-	// it.
-	if err := validateTrustedIssuerURLs(c.TrustedIssuers, c.InsecureAllowHTTP); err != nil {
+	// reaches Config.Validate(), so a malformed trusted-issuer config must
+	// fail here, before that side-effecting work runs — not on a crash loop
+	// after it, which would also orphan an upstream registration on every
+	// restart with the default in-memory DCR store.
+	if err := validateTrustedIssuers(c.TrustedIssuers, c.Issuer); err != nil {
 		return err
 	}
 	return c.validateBaselineClientScopes()
@@ -796,7 +814,7 @@ func (c *Config) Validate() error {
 	// buildUpstreamConfigs's live DCR registration happens before this method
 	// is reached), but a caller that constructs Config directly bypasses that,
 	// same as the BaselineClientScopes check above.
-	if err := validateTrustedIssuerURLs(c.TrustedIssuers, c.InsecureAllowHTTP); err != nil {
+	if err := validateTrustedIssuers(c.TrustedIssuers, c.Issuer); err != nil {
 		return err
 	}
 	c.warnTrustedIssuerAudiences()
@@ -838,56 +856,66 @@ func (c *Config) validateDelegationTokenLifespan() error {
 	return nil
 }
 
-// validateTrustedIssuerURLs checks the URL fields of each configured
-// TrustedIssuer that NewMultiIssuerTokenValidator's constructor cannot check
-// on its own. Shared by RunConfig.Validate() and Config.Validate() — see the
-// comments at both call sites for why the same check must run at both
-// layers (mirrors validateBaselineClientScopes).
+// validateTrustedIssuers checks every configured TrustedIssuer as early as
+// RunConfig.Validate can catch it: URL-shape checks below (issuer_url/
+// jwks_url scheme, and the private-IP-literal guard on jwks_url), plus every
+// structural check tokenexchange.ValidateTrustedIssuers performs (required
+// fields, self-issuer collision, duplicate issuers, an ActorClaim
+// assignClaim can actually surface in Extra). Shared by RunConfig.Validate()
+// and Config.Validate() — see the comments at both call sites for why the
+// same check must run at both layers (mirrors validateBaselineClientScopes).
+//
+// Catching the structural checks here — not only in
+// NewMultiIssuerTokenValidator's constructor — matters because
+// buildUpstreamConfigs performs live RFC 7591 registration against upstream
+// IdPs before the constructor is ever reached: a bad actor_claim or a
+// duplicate issuer_url must fail before that side-effecting work runs, not
+// after it on a crash loop that orphans an upstream registration on every
+// restart. NewMultiIssuerTokenValidator still repeats all of this at server
+// startup as defence in depth.
 //
 // IssuerURL is an OIDC issuer identifier, so it is held to the same rules as
-// the server's own Issuer via validateIssuerURL (https, or http when
-// insecureAllowHTTP permits it — including its localhost exception; no
-// query, fragment, or trailing slash). JWKSURL, when set, is an ordinary
-// endpoint URL rather than an issuer identifier — real-world jwks_uri
-// values legitimately carry a query string (e.g. Azure AD B2C's includes
-// "?p=...") — so it is checked by validateJWKSEndpointURL instead, which has
-// no localhost exception: resolveJWKS's dial-time isDisallowedIP guard
-// blocks loopback JWKS fetches unconditionally, so a loopback jwks_url can
-// never succeed at exchange time regardless of insecureAllowHTTP, and
-// failing at config time beats failing on the first token exchange.
-//
-// Everything else (required fields, self-issuer collision, duplicate
-// issuers, ActorClaim reachability) is validated by
-// NewMultiIssuerTokenValidator at server startup and is deliberately not
-// duplicated here.
-func validateTrustedIssuerURLs(issuers []tokenexchange.TrustedIssuer, insecureAllowHTTP bool) error {
+// the server's own Issuer via validateIssuerURL (https, or http when the
+// issuer's own InsecureAllowHTTP permits it — including its localhost
+// exception; no query, fragment, or trailing slash). JWKSURL, when set, is
+// an ordinary endpoint URL rather than an issuer identifier — real-world
+// jwks_uri values legitimately carry a query string (e.g. Azure AD B2C's
+// includes "?p=...") — so it is checked by validateJWKSEndpointURL instead,
+// which has no localhost exception and also rejects a private/loopback IP
+// literal unless the issuer's own AllowPrivateIPs permits it: failing at
+// config time beats failing on the first token exchange.
+func validateTrustedIssuers(issuers []tokenexchange.TrustedIssuer, selfIssuer string) error {
 	for _, ti := range issuers {
-		if err := validateIssuerURL(ti.IssuerURL, insecureAllowHTTP); err != nil {
+		if err := validateIssuerURL(ti.IssuerURL, ti.InsecureAllowHTTP); err != nil {
 			return fmt.Errorf("trusted_issuers: issuer_url %q: %w", ti.IssuerURL, err)
 		}
 		if ti.JWKSURL != "" {
-			if err := validateJWKSEndpointURL(ti.JWKSURL, insecureAllowHTTP); err != nil {
+			if err := validateJWKSEndpointURL(ti.JWKSURL, ti.InsecureAllowHTTP, ti.AllowPrivateIPs); err != nil {
 				return fmt.Errorf("trusted_issuers: jwks_url %q: %w", ti.JWKSURL, err)
 			}
 		}
 	}
+	if err := tokenexchange.ValidateTrustedIssuers(issuers, selfIssuer); err != nil {
+		return fmt.Errorf("trusted_issuers: %w", err)
+	}
 	return nil
 }
 
-// validateJWKSEndpointURL checks that rawURL parses, has a host, and uses
-// the "https" scheme (or "http" when insecureAllowHTTP is set). Unlike
-// validateIssuerURL, it does not enforce OIDC issuer-identifier rules
-// (no query/fragment/trailing-slash) since a JWKS endpoint legitimately
-// carries those.
+// validateJWKSEndpointURL checks that rawURL parses, has a host, uses the
+// "https" scheme (or "http" when insecureAllowHTTP is set), and — when the
+// host is an IP literal — is not a private or loopback address unless
+// allowPrivateIPs permits it. Unlike validateIssuerURL, it does not enforce
+// OIDC issuer-identifier rules (no query/fragment/trailing-slash) since a
+// JWKS endpoint legitimately carries those.
 //
 // Deliberately not networking.ValidateEndpointURL /
 // ValidateEndpointURLWithInsecure: both also honor the
 // INSECURE_DISABLE_URL_VALIDATION environment variable, which would let an
 // unrelated env var silently disable this SSRF-relevant scheme check; the
 // insecure variant also skips the parse/host check entirely rather than
-// only relaxing the scheme. This helper takes its "insecure" bit solely from
-// the operator's explicit InsecureAllowHTTP config field.
-func validateJWKSEndpointURL(rawURL string, insecureAllowHTTP bool) error {
+// only relaxing the scheme. This helper takes its "insecure" bits solely
+// from the issuer's own explicit InsecureAllowHTTP/AllowPrivateIPs fields.
+func validateJWKSEndpointURL(rawURL string, insecureAllowHTTP, allowPrivateIPs bool) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
@@ -897,6 +925,9 @@ func validateJWKSEndpointURL(rawURL string, insecureAllowHTTP bool) error {
 	}
 	if u.Scheme != "https" && !(u.Scheme == "http" && insecureAllowHTTP) {
 		return fmt.Errorf("scheme must be https (or http when insecure_allow_http is set)")
+	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil && !allowPrivateIPs && networking.IsPrivateIP(ip) {
+		return fmt.Errorf("must not point to a private or loopback address (set allow_private_ips to permit)")
 	}
 	return nil
 }
