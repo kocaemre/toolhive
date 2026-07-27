@@ -1049,7 +1049,7 @@ func TestTokenExchangeHandler_ActChainProvenance(t *testing.T) {
 	// a well-formed may_act naming this client bypasses the allowlist
 	// entirely. Only covered at the checkDelegationConsent unit level until
 	// now — this exercises it through the full handler.
-	t.Run("external token carrying may_act authorizes this client without nesting an external actor", func(t *testing.T) {
+	t.Run("external token carrying may_act still nests the issuer, with no actor to report", func(t *testing.T) {
 		t.Parallel()
 		h := newTestHandlerWithValidator(multiValidator, 15*time.Minute)
 
@@ -1067,7 +1067,17 @@ func TestTokenExchangeHandler_ActChainProvenance(t *testing.T) {
 		act, ok := sess.JWTClaims.Extra["act"].(map[string]any)
 		require.True(t, ok, "act claim must be a map")
 		assert.Equal(t, testAgentClientID, act["sub"])
-		assert.Nil(t, act["act"], "may_act consent carries no ExternalActor, so no external nesting occurs")
+
+		// The path that bypasses the allowlist entirely still records where
+		// the delegation came from (ValidatedClaims.ExternalIssuer is set
+		// unconditionally by validateExternalToken) — it just has no
+		// client-namespace actor claim to report, since may_act.sub already
+		// named the delegate directly via the outermost act.sub above.
+		nested, ok := act["act"].(map[string]any)
+		require.True(t, ok, "external issuer must be nested even on the may_act path")
+		assert.Equal(t, testExternalIssuer, nested["iss"])
+		_, hasSub := nested["sub"]
+		assert.False(t, hasSub, "no ExternalActor exists on the may_act path")
 	})
 
 	// maxDelegationDepth (10) bounds actChainDepth(priorAct) + newLevels. The

@@ -8,7 +8,6 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/url"
 	"regexp"
 	"slices"
@@ -140,15 +139,15 @@ type RunConfig struct {
 	//     operator configures the external IdP's API identifier to be exactly
 	//     one of ToolHive's AllowedAudiences URIs.
 	//  2. Scopes: the handler rejects any requested scope absent from the
-	//     subject token's "scope" claim with invalid_scope — it does not
-	//     intersect down to a reduced grant. A subject token with no "scope"
-	//     claim therefore rejects every scoped request; only a scopeless
-	//     request succeeds. Microsoft Entra v2 access tokens carry scopes
-	//     under "scp", not "scope" — the JWT claim handling is unchanged by
-	//     this document, so an Entra subject token hits this same case even
-	//     when it does carry scopes. Worth expecting up front, since Entra is
-	//     also the provider tokenexchange.TrustedIssuer's ActorClaim default
-	//     ("azp") targets.
+	//     subject token's granted scopes with invalid_scope — it does not
+	//     intersect down to a reduced grant. Both the "scope" string claim
+	//     (RFC 9068) and the "scp" array claim are read ("scope" wins if
+	//     both are present), so a subject token with neither claim rejects
+	//     every scoped request; only a scopeless request succeeds. "scp" is
+	//     not an Entra-specific quirk — it's what fosite's own default JWT
+	//     claims strategy writes for a self-issued ToolHive access token, so
+	//     this matters even for the self-issued token-exchange path.
+	//     Microsoft Entra v2 access tokens carry scopes under "scp" too.
 	//  3. Subject namespace: a trusted issuer is trusted to assert ANY
 	//     subject this server will accept for delegation — the delegated
 	//     token carries ToolHive's own "iss" with the external token's "sub"
@@ -859,9 +858,10 @@ func (c *Config) validateDelegationTokenLifespan() error {
 
 // validateTrustedIssuers checks every configured TrustedIssuer as early as
 // RunConfig.Validate can catch it: URL-shape checks below (issuer_url/
-// jwks_url scheme, and the private-IP-literal guard on jwks_url), plus every
-// structural check tokenexchange.ValidateTrustedIssuers performs (required
-// fields, self-issuer collision, duplicate issuers, an ActorClaim
+// jwks_url scheme, and the private-IP-literal guard on jwks_url), the
+// allow_private_ips/jwks_url pairing (see the check itself for why), plus
+// every structural check tokenexchange.ValidateTrustedIssuers performs
+// (required fields, self-issuer collision, duplicate issuers, an ActorClaim
 // assignClaim can actually surface in Extra). Shared by RunConfig.Validate()
 // and Config.Validate() — see the comments at both call sites for why the
 // same check must run at both layers (mirrors validateBaselineClientScopes).
@@ -896,6 +896,21 @@ func validateTrustedIssuers(issuers []tokenexchange.TrustedIssuer, selfIssuer st
 		if err := validateTrustedIssuerURL(ti.IssuerURL, ti.InsecureAllowHTTP); err != nil {
 			return fmt.Errorf("trusted_issuers: issuer_url %q: %w", ti.IssuerURL, err)
 		}
+		// AllowPrivateIPs without a hand-configured jwks_url would let OIDC
+		// discovery — a document fetched from, and thus influenceable by,
+		// the external issuer itself — choose the private target the dial
+		// is allowed to reach. Requiring jwks_url pins that target to
+		// operator-supplied config instead. This mirrors the operator's own
+		// CRD-level CEL rule (mcpexternalauthconfig_types.go) requiring
+		// jwksUrl whenever allowPrivateIPs is set; enforcing it here too
+		// means a hand-written RunConfig can't bypass what the CRD path
+		// already guarantees.
+		if ti.AllowPrivateIPs && ti.JWKSURL == "" {
+			return fmt.Errorf(
+				"trusted_issuers: issuer_url %q: allow_private_ips requires jwks_url to be set explicitly; "+
+					"otherwise OIDC discovery — fetched from the external issuer — would choose the private target",
+				ti.IssuerURL)
+		}
 		if ti.JWKSURL != "" {
 			if err := validateJWKSEndpointURL(ti.JWKSURL, ti.InsecureAllowHTTP, ti.AllowPrivateIPs); err != nil {
 				return fmt.Errorf("trusted_issuers: jwks_url %q: %w", ti.JWKSURL, err)
@@ -915,6 +930,12 @@ func validateTrustedIssuers(issuers []tokenexchange.TrustedIssuer, selfIssuer st
 // OIDC issuer-identifier rules (no query/fragment/trailing-slash) since a
 // JWKS endpoint legitimately carries those.
 //
+// Delegates to tokenexchange.ValidateJWKSURL, the same predicate the runtime
+// choke point (resolveJWKS, called on every JWKS fetch) enforces — the two
+// were previously separate implementations that had drifted apart (a
+// runtime check laxer than this one would silently defeat this config-time
+// guard), so this is now the single source of truth for both.
+//
 // Deliberately not networking.ValidateEndpointURL /
 // ValidateEndpointURLWithInsecure: both also honor the
 // INSECURE_DISABLE_URL_VALIDATION environment variable, which would let an
@@ -923,20 +944,7 @@ func validateTrustedIssuers(issuers []tokenexchange.TrustedIssuer, selfIssuer st
 // only relaxing the scheme. This helper takes its "insecure" bits solely
 // from the issuer's own explicit InsecureAllowHTTP/AllowPrivateIPs fields.
 func validateJWKSEndpointURL(rawURL string, insecureAllowHTTP, allowPrivateIPs bool) error {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("invalid URL: %w", err)
-	}
-	if u.Host == "" {
-		return fmt.Errorf("host is required")
-	}
-	if u.Scheme != "https" && !(u.Scheme == "http" && insecureAllowHTTP) {
-		return fmt.Errorf("scheme must be https (or http when insecure_allow_http is set)")
-	}
-	if ip := net.ParseIP(u.Hostname()); ip != nil && !allowPrivateIPs && networking.IsPrivateIP(ip) {
-		return fmt.Errorf("must not point to a private or loopback address (set allow_private_ips to permit)")
-	}
-	return nil
+	return tokenexchange.ValidateJWKSURL(rawURL, insecureAllowHTTP, allowPrivateIPs)
 }
 
 // warnTrustedIssuerAudiences logs a warning for each TrustedIssuer whose

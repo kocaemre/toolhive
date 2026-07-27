@@ -72,15 +72,19 @@ whether to grant the exchange, in this order:
    subject namespace (and scope names) must be disjoint from every upstream
    provider's and from every other trusted issuer's, or it can mint a
    delegated token indistinguishable from a real user's.
-3. **Provenance is partial.** The RFC 8693 §4.1 `act` claim records who acted:
-   `act.sub` is always the ToolHive client, with the external issuer/actor
-   nested one level in — but only on the allowlist path (`ExternalActor` is
-   what triggers the nesting). A `may_act`-bearing external token yields
-   `act = {sub: <toolhive-client>}` with no record that the token originated
-   externally at all. Either way, Cedar authorizers key on `sub` and do not
-   read `act` — it is an audit trail, not an access control. (AWS STS role
-   mapping can read arbitrary claims including `act` via its CEL matcher, so
-   "authorizers" here means Cedar specifically, not every consumer.)
+3. **Provenance is recorded for every external token.** The RFC 8693 §4.1
+   `act` claim records who acted: `act.sub` is always the ToolHive client,
+   with the external issuer nested one level in — `ValidatedClaims.ExternalIssuer`
+   is set for every token validated by the external-issuer path, whether or
+   not it also carries `may_act`. The nested entry additionally carries `sub`
+   (the allowlisted actor claim) when the allowlist path resolved one;
+   a `may_act`-bearing external token yields `act = {sub: <toolhive-client>,
+   act: {iss: <external-issuer>}}` — no client-namespace actor to report, but
+   the issuer is still recorded. Either way, Cedar authorizers key on `sub`
+   and do not read `act` — it is an audit trail, not an access control. (AWS
+   STS role mapping can read arbitrary claims including `act` via its CEL
+   matcher, so "authorizers" here means Cedar specifically, not every
+   consumer.)
 4. **A `may_act`-emitting issuer bypasses the allowlist entirely.** Since it
    takes priority and can name any ToolHive client, that claim must be drawn
    from ToolHive's own client namespace and must not be influenceable by an
@@ -99,10 +103,12 @@ whether to grant the exchange, in this order:
   the delegated token is granted. A startup WARN fires when `expectedAudience`
   isn't in `allowedAudiences`.
 - **Scopes.** `grantScopes` rejects — it does not intersect — any requested
-  scope absent from the subject token's `scope` claim, with `invalid_scope`.
-  Only `"scope"` is read; Microsoft Entra v2 carries scopes under `scp`, which
-  isn't read, so an Entra subject token rejects every scoped request even
-  though it does carry scopes. Only a scopeless request succeeds.
+  scope absent from the subject token's granted scopes, with `invalid_scope`.
+  Both the RFC 9068 `"scope"` string claim and the `"scp"` array claim are
+  read (`"scope"` wins if both are present) — `"scp"` is not an Entra
+  quirk, it is what fosite's own default JWT claims strategy writes for a
+  self-issued ToolHive access token, so a genuine subject token minted by
+  this server's own token endpoint carries scopes this way already.
 - **Delegated token lifetime.** `min(subject token's remaining lifetime,
   configured delegationLifespan)`. A short-lived external token silently
   yields a short delegated token.
@@ -129,21 +135,30 @@ whether to grant the exchange, in this order:
   unlike the server's own issuer, grants no localhost exemption: an
   `http://localhost` trusted issuer is rejected unless that issuer's own
   `insecure_allow_http` is set. There is no separate runtime scheme check for
-  `issuer_url` — only `jwks_url` gets one (`validateJWKSURL`, on every fetch).
-  `allowPrivateIPs` (requires `jwksUrl` to be set) independently controls
-  whether the dial may resolve to a private or loopback address. On the
-  operator-managed (CRD) path there is no `insecureAllowHTTP` field at all, so
-  a plaintext trusted issuer cannot be expressed there regardless of the
-  private-IP setting; it is reachable only via a hand-written
-  `authserver.RunConfig`.
+  `issuer_url` — only `jwks_url` gets one (`ValidateJWKSURL`, on every fetch;
+  shared verbatim between the runtime choke point and the config-time check
+  so the two can't drift). On the operator-managed (CRD) path there is no
+  `insecureAllowHTTP` field at all, so a plaintext trusted issuer cannot be
+  expressed there regardless of the private-IP setting; it is reachable only
+  via a hand-written `authserver.RunConfig`.
+- **`allowPrivateIPs` requires `jwksUrl`.** Enforced at config time by
+  `validateTrustedIssuers` (`pkg/authserver/config.go`) for every RunConfig,
+  not only on the operator-managed (CRD) path — the CRD's Kubebuilder CEL
+  rule (`mcpexternalauthconfig_types.go`) enforces the identical constraint
+  independently, so a hand-written `authserver.RunConfig` can no longer
+  bypass what the CRD path already guarantees. The reason is the same either
+  way: without a hand-configured `jwksUrl`, OIDC discovery — a document
+  fetched from, and thus influenceable by, the external issuer itself —
+  would choose the private JWKS dial target, which is exactly what pinning
+  it to operator config prevents.
 - **Misconfiguration surfaces as a pod crash**, not an operator condition —
   check pod logs, not `kubectl describe`.
 
 ## Implementation
 
 - `pkg/authserver/server/tokenexchange/handler.go` — `checkDelegationConsent`, `grantScopes`, `grantAndBoundAudiences`
-- `pkg/authserver/server/tokenexchange/multi_issuer_validator.go` — `MultiIssuerTokenValidator`, `TrustedIssuer`, `resolveAllowedActor`, `validateJWKSURL`
-- `pkg/authserver/server/tokenexchange/validator.go` — `assignClaim`, `buildValidatedClaims`, `validateMayActShape`
-- `pkg/authserver/config.go` — `validateTrustedIssuerURL`, `validateJWKSEndpointURL`, `warnTrustedIssuerAudiences`
+- `pkg/authserver/server/tokenexchange/multi_issuer_validator.go` — `MultiIssuerTokenValidator`, `TrustedIssuer`, `resolveAllowedActor`, `ValidateJWKSURL`
+- `pkg/authserver/server/tokenexchange/validator.go` — `assignClaim`, `buildValidatedClaims`, `validateMayActShape`, `scpToScopeString`
+- `pkg/authserver/config.go` — `validateTrustedIssuerURL`, `validateJWKSEndpointURL`, `validateTrustedIssuers`, `warnTrustedIssuerAudiences`
 - `cmd/thv-operator/api/v1beta1/mcpexternalauthconfig_types.go` — `TrustedIssuerConfig`
 - `cmd/thv-operator/pkg/controllerutil/authserver.go` — `buildTrustedIssuersRunConfig`

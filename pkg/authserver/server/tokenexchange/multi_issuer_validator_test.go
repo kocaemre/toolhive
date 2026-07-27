@@ -143,6 +143,7 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				assert.Equal(t, []string{testIssuer}, vc.Audience)
 				assert.Equal(t, "Test User", vc.Name)
 				assert.Equal(t, "test@example.com", vc.Email)
+				assert.Empty(t, vc.ExternalIssuer, "self-issued path must never set ExternalIssuer")
 			},
 		},
 		{
@@ -172,6 +173,7 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				assert.False(t, vc.Expiry.IsZero())
 				assert.False(t, vc.IssuedAt.IsZero())
 				assert.Equal(t, "ext-agent", vc.ExternalActor, "actor claim matched via default azp")
+				assert.Equal(t, testExternalIssuer, vc.ExternalIssuer)
 			},
 		},
 		{
@@ -372,6 +374,8 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				require.NotNil(t, vc.MayAct)
 				assert.Equal(t, "some-toolhive-client", vc.MayAct.Sub)
 				assert.Empty(t, vc.ExternalActor, "allowlist is skipped whenever may_act is present")
+				assert.Equal(t, testExternalIssuer, vc.ExternalIssuer,
+					"provenance must still be recorded on the may_act path, which bypasses the allowlist")
 			},
 		},
 		{
@@ -393,6 +397,7 @@ func TestMultiIssuerTokenValidator_Validate(t *testing.T) {
 				t.Helper()
 				require.NotNil(t, vc.MayAct)
 				assert.Empty(t, vc.ExternalActor)
+				assert.Equal(t, testExternalIssuer, vc.ExternalIssuer)
 			},
 		},
 		{
@@ -1095,36 +1100,59 @@ func TestMultiIssuerTokenValidator_KidMismatch(t *testing.T) {
 	assert.Nil(t, result)
 }
 
-// TestValidateJWKSURL exercises validateJWKSURL directly: this is the SSRF
+// TestValidateJWKSURL exercises ValidateJWKSURL directly: this is the SSRF
 // guard applied in resolveJWKS to every JWKS URL for a given issuer, whether
-// hand-configured on TrustedIssuer or resolved via discovery. The equivalent
-// check on redirect hops (networking.SameHostRedirectPolicy) and the
-// dial-time IP guard (networking.NewHostScopedClientBuilder) are exercised
-// via the networking package's own tests, not here. These cases all pass
-// insecureAllowHTTP=false, allowPrivateIPs=false — the strict defaults —
-// since every other test in this file goes through newMultiValidator, which
-// sets both permissive flags on its test issuers to reach their httptest
-// servers over plain HTTP on loopback.
+// hand-configured on TrustedIssuer or resolved via discovery, and shared
+// verbatim with pkg/authserver/config.go's config-time check
+// (validateJWKSEndpointURL) so the two can't drift out of sync. The
+// equivalent check on redirect hops (networking.SameHostRedirectPolicy) and
+// the dial-time IP guard (networking.NewHostScopedClientBuilder) are
+// exercised via the networking package's own tests, not here. These cases
+// all pass insecureAllowHTTP=false, allowPrivateIPs=false — the strict
+// defaults — since every other test in this file goes through
+// newMultiValidator, which sets both permissive flags on its test issuers to
+// reach their httptest servers over plain HTTP on loopback; the
+// insecureAllowHTTP=true cases below are the exception, covering the laxity
+// that must not extend beyond "http" to every other non-https scheme.
 func TestValidateJWKSURL(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		url     string
-		wantErr string
+		name              string
+		url               string
+		insecureAllowHTTP bool
+		wantErr           string
 	}{
 		{name: "https accepted", url: "https://issuer.example.com/jwks"},
 		{name: "http rejected", url: "http://issuer.example.com/jwks", wantErr: "must use HTTPS"},
+		{
+			name:              "http accepted with insecureAllowHTTP",
+			url:               "http://issuer.example.com/jwks",
+			insecureAllowHTTP: true,
+		},
+		{
+			name:              "ftp rejected even with insecureAllowHTTP",
+			url:               "ftp://issuer.example.com/jwks",
+			insecureAllowHTTP: true,
+			wantErr:           "must use HTTPS",
+		},
+		{
+			name:              "no scheme rejected even with insecureAllowHTTP",
+			url:               "//issuer.example.com/jwks",
+			insecureAllowHTTP: true,
+			wantErr:           "must use HTTPS",
+		},
 		{name: "loopback IP literal rejected", url: "https://127.0.0.1/jwks", wantErr: "private or loopback"},
 		{name: "private IP literal rejected", url: "https://10.1.2.3/jwks", wantErr: "private or loopback"},
 		{name: "unparseable URL rejected", url: "://not-a-url", wantErr: "invalid URL"},
+		{name: "missing host rejected", url: "https:///jwks", wantErr: "host is required"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := validateJWKSURL(tt.url, false, false)
+			err := ValidateJWKSURL(tt.url, tt.insecureAllowHTTP, false)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 				return

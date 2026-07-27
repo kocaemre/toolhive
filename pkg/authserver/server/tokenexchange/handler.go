@@ -159,23 +159,29 @@ func (h *Handler) HandleTokenEndpointRequest(ctx context.Context, requester fosi
 	nestUnder := act
 	newLevels := 1
 
-	// When the subject token came in via the external-issuer allowlist path
-	// (ValidatedClaims.ExternalActor is set only there — see
-	// multi_issuer_validator.go), nest that issuer/actor pair one level in.
-	// RFC 8693 §4.1 anticipates exactly this: "the combination of the two
-	// claims 'iss' and 'sub' might be necessary to uniquely identify an
-	// actor." Without it, the issued token would carry no record that the
-	// delegation originated externally, and the allowlist's accepted
+	// When the subject token came from a trusted external issuer
+	// (ValidatedClaims.ExternalIssuer is set only there — see
+	// multi_issuer_validator.go), nest that issuer one level in, together
+	// with the allowlisted actor when one was resolved. RFC 8693 §4.1
+	// anticipates exactly this: "the combination of the two claims 'iss' and
+	// 'sub' might be necessary to uniquely identify an actor." Without this,
+	// the issued token would carry no record that the delegation originated
+	// externally at all — including for a may_act-bearing external token,
+	// which leaves ExternalActor unset because may_act.sub already names the
+	// delegate directly via the actorID binding above. That token still has
+	// an external issuer worth recording, so nesting here is keyed on
+	// ExternalIssuer, not ExternalActor: the allowlist path's accepted
 	// any-ToolHive-client scope limitation (see checkDelegationConsent)
-	// depends on that provenance being auditable after the fact. This is
-	// deliberately scoped to ExternalActor, not "any external token": a
-	// may_act-bearing external token already names its delegate explicitly
-	// via the actorID binding above, so it doesn't rely on this same audit
-	// trail.
-	if validatedClaims.ExternalActor != "" {
-		external := map[string]any{
-			"sub": validatedClaims.ExternalActor,
-			"iss": validatedClaims.Issuer,
+	// depends on this provenance being auditable after the fact, and a
+	// may_act-bearing external token — the path that bypasses the allowlist
+	// entirely — needs it at least as much.
+	if validatedClaims.ExternalIssuer != "" {
+		external := map[string]any{"iss": validatedClaims.ExternalIssuer}
+		// ExternalActor is only present on the allowlist path (see its doc
+		// comment) — a may_act-bearing external token has no client-namespace
+		// actor claim to report, so the nested entry there carries "iss" only.
+		if validatedClaims.ExternalActor != "" {
+			external["sub"] = validatedClaims.ExternalActor
 		}
 		act["act"] = external
 		nestUnder = external

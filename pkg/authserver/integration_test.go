@@ -804,6 +804,98 @@ func TestIntegration_TokenExchange_ConfidentialClientHappyPath(t *testing.T) {
 		"delegated token exp must be capped at the 15m delegation lifespan, not the subject token's 30m")
 }
 
+// TestIntegration_TokenExchange_SelfIssuedSubjectTokenScopeFromScp proves
+// that a token-exchange request carrying a requested scope succeeds against
+// a subject token minted by the server's own authorization_code grant, not
+// just a hand-built JWT.
+//
+// ToolHive's own issued access tokens carry granted scopes as a "scp" array
+// claim, not the RFC 9068 "scope" string claim — fosite's default JWT claims
+// strategy writes "scp" unless ScopeField is explicitly String or Both, which
+// this server does not set (see TestIntegration_FullPKCEFlow's own "scp"
+// assertion). Every other token-exchange test in this file hand-mints its
+// subject token with an explicit "scope" claim, which masks this: assignClaim
+// previously only read "scope", so a genuine self-issued access token used as
+// subject_token always resolved to Scopes == "", and grantScopes rejected any
+// requested scope with invalid_scope.
+func TestIntegration_TokenExchange_SelfIssuedSubjectTokenScopeFromScp(t *testing.T) {
+	t.Parallel()
+
+	const (
+		agentClientID     = "test-agent-client-scp"
+		agentClientSecret = "test-agent-secret-scp"
+	)
+
+	// The acting agent is also the client that logs in and obtains the
+	// subject token: it must be confidential (token exchange requires it) and
+	// registered for both authorization_code (to mint a genuine access token)
+	// and token-exchange (to perform the exchange as itself).
+	agentClient, err := registration.New(registration.Config{
+		ID:           agentClientID,
+		Secret:       agentClientSecret,
+		Public:       false,
+		RedirectURIs: []string{testRedirectURI},
+		GrantTypes:   []string{"authorization_code", oauthproto.GrantTypeTokenExchange},
+		Scopes:       registration.DefaultScopes,
+		Audience:     []string{testAudience},
+	})
+	require.NoError(t, err)
+
+	m := startMockOIDC(t)
+	ts := setupTestServerWithMockOIDC(t, m, withExtraClient(agentClient))
+
+	verifier := servercrypto.GeneratePKCEVerifier()
+	challenge := servercrypto.ComputePKCEChallenge(verifier)
+
+	authCode, _ := completeAuthorizationFlow(t, ts.Server.URL, authorizationParams{
+		ClientID:     agentClientID,
+		RedirectURI:  testRedirectURI,
+		State:        "scp-scope-state",
+		Challenge:    challenge,
+		Scope:        "openid profile",
+		ResponseType: "code",
+	})
+
+	// Mint the subject token via the real authorization_code grant (a
+	// confidential client, so client_secret is required), rather than
+	// hand-building a JWT — this is what makes the resulting token carry
+	// "scp", not "scope".
+	tokenResp := makeTokenRequest(t, ts.Server.URL, url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {authCode},
+		"redirect_uri":  {testRedirectURI},
+		"client_id":     {agentClientID},
+		"client_secret": {agentClientSecret},
+		"code_verifier": {verifier},
+	})
+	defer tokenResp.Body.Close()
+	tokenBody := parseTokenResponse(t, tokenResp)
+	require.Equal(t, http.StatusOK, tokenResp.StatusCode,
+		"authorization_code exchange should succeed, got %d (body: %v)", tokenResp.StatusCode, tokenBody)
+	subjectToken, ok := tokenBody["access_token"].(string)
+	require.True(t, ok, "access_token should be a string")
+	require.NotEmpty(t, subjectToken)
+
+	// Exchange the genuine access token for a delegated token, requesting a
+	// scope that was granted to it ("profile"). Before the assignClaim fix,
+	// this fails with invalid_scope because Scopes never picks up "scp".
+	resp := makeTokenRequest(t, ts.Server.URL, url.Values{
+		"grant_type":         {oauthproto.GrantTypeTokenExchange},
+		"subject_token":      {subjectToken},
+		"subject_token_type": {oauthproto.TokenTypeAccessToken},
+		"client_id":          {agentClientID},
+		"client_secret":      {agentClientSecret},
+		"scope":              {"profile"},
+	})
+	defer resp.Body.Close()
+
+	body := parseTokenResponse(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode,
+		"token exchange requesting a scope carried by the subject token's 'scp' claim should succeed, "+
+			"got %d (body: %v)", resp.StatusCode, body)
+	assert.Equal(t, "profile", body["scope"], "delegated token should be granted the requested scope")
+}
+
 // ============================================================================
 // RFC 8693 Token Exchange: Trusted External Issuer Integration Tests
 // ============================================================================
@@ -926,7 +1018,7 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 
 		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
 		require.NoError(t, err)
-		idpServer, discoveryHits := startExternalIdPServer(t, externalKey)
+		idpServer, _ := startExternalIdPServer(t, externalKey)
 
 		m := startMockOIDC(t)
 		ts := setupTestServerWithMockOIDC(t, m,
@@ -934,6 +1026,14 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
 				IssuerURL:         idpServer.URL,
 				ExpectedAudience:  testAudience,
+				// JWKSURL is required whenever AllowPrivateIPs is set (see
+				// validateTrustedIssuers in pkg/authserver/config.go): the
+				// private dial target must come from operator config, not an
+				// OIDC discovery document. idpServer is loopback, so
+				// AllowPrivateIPs is unavoidable here; "explicit jwks_url
+				// resolution path" below is the dedicated test for the
+				// discovery-vs-explicit distinction this used to also cover.
+				JWKSURL:           idpServer.URL + "/jwks",
 				AllowedActors:     []string{allowedActor},
 				InsecureAllowHTTP: true,
 				AllowPrivateIPs:   true,
@@ -961,10 +1061,6 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 		tokenType, ok := body["token_type"].(string)
 		require.True(t, ok, "token_type should be a string")
 		assert.Equal(t, "bearer", strings.ToLower(tokenType))
-
-		// No JWKSURL was configured, so the JWKS must have been resolved via
-		// OIDC discovery.
-		assert.GreaterOrEqual(t, discoveryHits.Load(), int64(1), "discovery endpoint must have been hit")
 
 		delegated, ok := body["access_token"].(string)
 		require.True(t, ok, "access_token should be a string")
@@ -1008,6 +1104,7 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
 				IssuerURL:         idpServer.URL,
 				ExpectedAudience:  testAudience,
+				JWKSURL:           idpServer.URL + "/jwks",
 				AllowedActors:     []string{allowedActor},
 				InsecureAllowHTTP: true,
 				AllowPrivateIPs:   true,
@@ -1055,6 +1152,7 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
 				IssuerURL:         idpServer.URL,
 				ExpectedAudience:  testAudience,
+				JWKSURL:           idpServer.URL + "/jwks",
 				InsecureAllowHTTP: true,
 				AllowPrivateIPs:   true,
 				// AllowedActors deliberately empty: may_act must be honored
@@ -1093,9 +1191,16 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 		act, ok := claims["act"].(map[string]any)
 		require.True(t, ok)
 		assert.Equal(t, agentClientID, act["sub"])
-		_, hasNestedAct := act["act"]
-		assert.False(t, hasNestedAct,
-			"may_act consent carries no ExternalActor, so no external provenance is nested")
+
+		// may_act carries no ExternalActor (see ValidatedClaims.ExternalActor's
+		// doc comment), but the external issuer must still be recorded — this
+		// is the path that bypasses the allowlist entirely, so it needs the
+		// audit trail at least as much as the allowlist path does.
+		nested, ok := act["act"].(map[string]any)
+		require.True(t, ok, "external issuer must still be nested even without an allowlisted actor")
+		assert.Equal(t, idpServer.URL, nested["iss"])
+		_, hasSub := nested["sub"]
+		assert.False(t, hasSub, "no client-namespace actor claim exists to report on the may_act path")
 	})
 
 	t.Run("untrusted issuer rejected before any JWKS fetch", func(t *testing.T) {
@@ -1123,6 +1228,7 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
 				IssuerURL:         idpServer.URL,
 				ExpectedAudience:  testAudience,
+				JWKSURL:           idpServer.URL + "/jwks",
 				AllowedActors:     []string{allowedActor},
 				InsecureAllowHTTP: true,
 				AllowPrivateIPs:   true,
@@ -1156,6 +1262,11 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 			"the error must not leak the untrusted issuer URL")
 
 		// The issuer-map miss must short-circuit before any JWKS fetch.
+		// Note: JWKSURL is now preconfigured above (see comment on the
+		// "allowlisted actor happy path" subtest), which already skips
+		// discovery on its own — so this assertion holding is necessary but
+		// not on its own sufficient proof of the short-circuit; the 400
+		// response and error content below are the discriminating checks.
 		assert.Zero(t, discoveryHits.Load(), "issuer-map miss must precede any JWKS discovery fetch")
 	})
 
@@ -1172,6 +1283,7 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
 				IssuerURL:         idpServer.URL,
 				ExpectedAudience:  testAudience,
+				JWKSURL:           idpServer.URL + "/jwks",
 				AllowedActors:     []string{allowedActor},
 				InsecureAllowHTTP: true,
 				AllowPrivateIPs:   true,
@@ -1219,6 +1331,16 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 		externalKey, err := rsa.GenerateKey(rand.Reader, 2048)
 		require.NoError(t, err)
 		idpServer, discoveryHits := startExternalIdPServer(t, externalKey)
+
+		// Prove the counter actually increments before relying on its
+		// zero-ness below — otherwise a discovery handler that silently
+		// stopped counting would make the "must skip discovery" assertion
+		// vacuously true.
+		discResp, err := http.Get(idpServer.URL + "/.well-known/openid-configuration") //nolint:noctx
+		require.NoError(t, err)
+		discResp.Body.Close()
+		require.Equal(t, int64(1), discoveryHits.Load(), "discovery counter must be live")
+		discoveryHits.Store(0)
 
 		m := startMockOIDC(t)
 		ts := setupTestServerWithMockOIDC(t, m,
@@ -1271,6 +1393,7 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
 				IssuerURL:         idpServer.URL,
 				ExpectedAudience:  testAudience,
+				JWKSURL:           idpServer.URL + "/jwks",
 				AllowedActors:     []string{allowedActor},
 				InsecureAllowHTTP: true,
 				AllowPrivateIPs:   true,
@@ -1337,6 +1460,7 @@ func TestIntegration_TokenExchange_TrustedExternalIssuer(t *testing.T) {
 			withTrustedIssuers([]tokenexchange.TrustedIssuer{{
 				IssuerURL:         idpServer.URL,
 				ExpectedAudience:  foreignAudience,
+				JWKSURL:           idpServer.URL + "/jwks",
 				AllowedActors:     []string{allowedActor},
 				InsecureAllowHTTP: true,
 				AllowPrivateIPs:   true,

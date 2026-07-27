@@ -922,6 +922,25 @@ func TestConfigValidate_TrustedIssuers(t *testing.T) {
 			},
 		},
 		{
+			// Mirrors the CRD's Kubebuilder CEL rule requiring jwksUrl
+			// whenever allowPrivateIPs is set (mcpexternalauthconfig_types.go):
+			// without a hand-configured jwks_url, OIDC discovery — a document
+			// fetched from, and thus influenceable by, the external issuer
+			// itself — would choose the private JWKS dial target. A
+			// hand-written RunConfig must not be able to bypass what the CRD
+			// path already guarantees.
+			name: "allow_private_ips without jwks_url rejected",
+			issuers: []tokenexchange.TrustedIssuer{
+				{
+					IssuerURL:        "https://idp.example.com",
+					ExpectedAudience: "https://mcp.example.com",
+					AllowPrivateIPs:  true,
+				},
+			},
+			wantErr: true,
+			errMsg:  "allow_private_ips requires jwks_url",
+		},
+		{
 			name: "missing expected_audience rejected",
 			issuers: []tokenexchange.TrustedIssuer{
 				{IssuerURL: "https://idp.example.com"},

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -51,8 +52,14 @@ type ValidatedClaims struct {
 	Email string
 	// ClientID is the OAuth client ID from the custom "client_id" claim.
 	ClientID string
-	// Scopes is the space-delimited scope string from the "scope" claim.
-	// Empty if the subject token carries no scope claim.
+	// Scopes is the space-delimited scope string assembled from the "scope"
+	// or "scp" claim. RFC 9068 §2.2.1 spells it "scope" as a JSON string, but
+	// fosite's default JWT claims strategy (token/jwt/claims_jwt.go) writes
+	// scopes as a JSON array under "scp" instead, unless ScopeField is
+	// explicitly set to String or Both — this server does not set it, so a
+	// genuine ToolHive-issued access token used as a subject token carries
+	// "scp", not "scope". When both are present, "scope" wins. Empty if the
+	// subject token carries neither claim.
 	Scopes string
 	// MayAct holds the authorized actor from the "may_act" claim (RFC 8693 §4.4).
 	// Nil when the subject token does not carry a may_act claim.
@@ -67,6 +74,18 @@ type ValidatedClaims struct {
 	// instead). A non-empty value means the validator has already authorized
 	// this token's actor for delegation; it is not itself a raw claim.
 	ExternalActor string
+	// ExternalIssuer is set by the external-issuer validation path
+	// (validateExternalToken in multi_issuer_validator.go) to that issuer's
+	// IssuerURL, for EVERY external token it validates — unlike
+	// ExternalActor, this is set regardless of whether the token carries a
+	// may_act claim. It exists so the handler can record provenance (which
+	// issuer a delegation actually originated from) even for a
+	// may_act-bearing external token, which leaves ExternalActor unset.
+	// Empty for self-issued tokens. Like ExternalActor, it is never
+	// populated from token claims by buildValidatedClaims or assignClaim —
+	// it comes from the already-validated issuer config the token matched,
+	// not from anything token-supplied, so it cannot be spoofed via claims.
+	ExternalIssuer string
 	// Extra contains all non-standard claims not captured by other fields.
 	Extra map[string]any
 }
@@ -252,14 +271,52 @@ func buildValidatedClaims(
 		assignClaim(vc, k, val)
 	}
 
+	// Fall back to "scp" only if "scope" (handled above) didn't already set
+	// Scopes. This must run after the loop, not inside assignClaim's per-key
+	// switch, because map iteration order is random — assignClaim can't tell
+	// whether a not-yet-seen "scope" claim will still show up.
+	if vc.Scopes == "" {
+		if scp, ok := extra["scp"]; ok {
+			vc.Scopes = scpToScopeString(scp)
+		}
+	}
+
 	return vc
+}
+
+// scpToScopeString normalizes an "scp" claim value into a space-delimited
+// scope string. fosite's default JWT claims strategy writes "scp" as a JSON
+// array (see the Scopes field doc comment), which json.Unmarshal decodes as
+// []any — but a plain space-delimited string is accepted too, in case an
+// issuer writes it that way instead. Non-string array elements are skipped
+// rather than rejected: a malformed entry degrades to a smaller scope set
+// instead of failing subject-token validation outright.
+func scpToScopeString(val any) string {
+	switch v := val.(type) {
+	case string:
+		return v
+	case []any:
+		scopes := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				scopes = append(scopes, s)
+			}
+		}
+		return strings.Join(scopes, " ")
+	default:
+		return ""
+	}
 }
 
 // assignClaim routes one non-standard JWT claim onto its structured
 // ValidatedClaims field, or into Extra if it isn't a well-known claim.
 // Registered JWT claims (sub, iss, aud, exp, iat, nbf, jti) are dropped —
 // they're already captured in buildValidatedClaims's structured fields.
-// Keep actorClaimsNotInExtra (multi_issuer_validator.go) in sync with the cases here.
+// "scp" is likewise dropped here, though its value is read separately (see
+// buildValidatedClaims's post-loop fallback) since its precedence relative
+// to "scope" can't be decided from a single, order-independent key/value
+// pair. Keep actorClaimsNotInExtra (multi_issuer_validator.go) in sync with
+// the cases here.
 func assignClaim(vc *ValidatedClaims, key string, val any) {
 	switch key {
 	case "name":
@@ -278,6 +335,11 @@ func assignClaim(vc *ValidatedClaims, key string, val any) {
 		if s, ok := val.(string); ok {
 			vc.Scopes = s
 		}
+	case "scp":
+		// Handled by buildValidatedClaims after its call to assignClaim for
+		// every key completes, so "scope" (if present) wins regardless of
+		// map iteration order. Case exists here only to keep "scp" out of
+		// Extra, like every other well-known claim below.
 	case "may_act":
 		if m, ok := val.(map[string]any); ok {
 			if s, ok := m["sub"].(string); ok {

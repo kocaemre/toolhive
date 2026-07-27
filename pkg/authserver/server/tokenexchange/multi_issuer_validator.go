@@ -69,7 +69,7 @@ const (
 // fallback in resolveAllowedActor; configuring ActorClaim to any of these
 // would make every external token look like it's missing the claim.
 var actorClaimsNotInExtra = []string{
-	"sub", "iss", "aud", "exp", "iat", "nbf", "jti", "name", "email", "scope", "may_act",
+	"sub", "iss", "aud", "exp", "iat", "nbf", "jti", "name", "email", "scope", "scp", "may_act",
 }
 
 // Compile-time check that MultiIssuerTokenValidator implements SubjectTokenValidator.
@@ -249,7 +249,7 @@ func NewMultiIssuerTokenValidator(
 		// One residual: the built client's ValidatingTransport still skips
 		// its HTTPS-scheme check when INSECURE_DISABLE_URL_VALIDATION is
 		// set — that env read is baked into every builder-made client in
-		// this repo. It is backstopped here: validateJWKSURL, called from
+		// this repo. It is backstopped here: ValidateJWKSURL, called from
 		// resolveJWKS before every fetch, enforces the scheme independently
 		// of any environment variable, so it must stay there rather than
 		// being treated as redundant with this client's own check.
@@ -393,6 +393,16 @@ func (v *MultiIssuerTokenValidator) validateExternalToken(
 
 	claims := buildValidatedClaims(standardClaims, extraClaims)
 
+	// Record provenance for every external token, regardless of which
+	// consent path grants it below — including a may_act-bearing one, which
+	// leaves ExternalActor unset. Without this, a may_act-authorized
+	// external token was indistinguishable from a self-issued exchange
+	// downstream (see ExternalIssuer's doc comment), which is backwards: the
+	// path that bypasses the AllowedActors allowlist is the one that most
+	// needs an audit trail. Set from issuerConfig, already matched against
+	// the validated "iss" claim above — never from token content.
+	claims.ExternalIssuer = issuerConfig.IssuerURL
+
 	// Delegation consent for the external path: a may_act claim is
 	// authoritative and is enforced by the caller (checkDelegationConsent)
 	// against the authenticated client, so nothing further is required here
@@ -426,7 +436,7 @@ func (v *MultiIssuerTokenValidator) validateExternalToken(
 // resolveJWKS returns the cached JWKS for an external issuer, fetching it if
 // the cache is empty or expired. If the JWKS URL is not configured, it is first
 // resolved via OIDC discovery. Before every fetch, the resolved URL (whether
-// hand-configured or just discovered) is checked by validateJWKSURL against
+// hand-configured or just discovered) is checked by ValidateJWKSURL against
 // this issuer's own InsecureAllowHTTP/AllowPrivateIPs — the single point both
 // paths pass through, so neither can bypass the HTTPS/SSRF guard.
 //
@@ -506,7 +516,7 @@ func (v *MultiIssuerTokenValidator) fetchAndValidateJWKS(
 	// just discovered above. A configured JWKSURL never reaches
 	// discoverJWKSURL, so checking only there would leave hand-configured
 	// URLs unvalidated.
-	if err := validateJWKSURL(issuerConfig.jwksURL, issuerConfig.InsecureAllowHTTP, issuerConfig.AllowPrivateIPs); err != nil {
+	if err := ValidateJWKSURL(issuerConfig.jwksURL, issuerConfig.InsecureAllowHTTP, issuerConfig.AllowPrivateIPs); err != nil {
 		return nil, fmt.Errorf("jwks_url for issuer %s is invalid: %w", issuerConfig.IssuerURL, err)
 	}
 
@@ -578,20 +588,31 @@ func (*MultiIssuerTokenValidator) discoverJWKSURL(ctx context.Context, issuerCon
 	return doc.JWKSURI, nil
 }
 
-// validateJWKSURL checks that jwksURL uses HTTPS, unless insecureAllowHTTP
-// permits plain HTTP, and is not a private/loopback address literal, unless
+// ValidateJWKSURL checks that jwksURL parses, has a host, uses HTTPS unless
+// insecureAllowHTTP permits plain HTTP — and only exactly the "http" scheme,
+// not any other non-https scheme such as "file" or "ftp" — and, when the
+// host is an IP literal, is not a private or loopback address unless
 // allowPrivateIPs permits that. Both flags come from the specific
 // TrustedIssuer being fetched (see resolveJWKS), never from a validator-wide
 // or self-issuer setting. This prevents SSRF attacks where a compromised
 // discovery document — or a hand-configured jwks_url — points to internal
 // services.
-func validateJWKSURL(jwksURL string, insecureAllowHTTP, allowPrivateIPs bool) error {
+//
+// This is the single implementation shared by the runtime choke point above
+// (resolveJWKS, on every fetch) and pkg/authserver/config.go's config-time
+// check (validateJWKSEndpointURL): the two must not drift out of sync, or a
+// laxer runtime check would silently defeat the config-time guard.
+func ValidateJWKSURL(jwksURL string, insecureAllowHTTP, allowPrivateIPs bool) error {
 	u, err := url.Parse(jwksURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
 	}
 
-	if u.Scheme != "https" && !insecureAllowHTTP {
+	if u.Host == "" {
+		return errors.New("host is required")
+	}
+
+	if u.Scheme != "https" && !(u.Scheme == "http" && insecureAllowHTTP) {
 		return fmt.Errorf("must use HTTPS, got %q", u.Scheme)
 	}
 
