@@ -49,7 +49,7 @@ require (
 	github.com/shirou/gopsutil/v4 v4.26.5
 	github.com/spf13/viper v1.21.0
 	github.com/stacklok/toolhive-catalog v0.20260727.0
-	github.com/stacklok/toolhive-core v0.0.35-0.20260728100836-a09dd83029b2
+	github.com/stacklok/toolhive-core v0.0.35-0.20260728110834-71d805a7df02
 	github.com/stretchr/testify v1.11.1
 	github.com/swaggo/swag/v2 v2.0.0-rc5
 	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd
